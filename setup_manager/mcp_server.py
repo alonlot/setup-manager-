@@ -3,8 +3,8 @@
 Run with stdio (default):      setup-manager mcp
 Or over HTTP (streamable):     setup-manager mcp --http --port 8801
 
-It uses the same config file as the GUI, so the setups you add in the GUI are
-visible here. USB devices are attached to the PC where this MCP server runs.
+It uses the same config file as the desktop app, so the setups you add in the
+app are visible here. USB devices are attached to the PC where this MCP server runs.
 """
 
 from __future__ import annotations
@@ -143,7 +143,8 @@ def build_server(store: ConfigStore | None = None) -> Any:
     @mcp.tool()
     async def keep_attached(setup: str, busid: str, enabled: bool = True) -> dict[str, Any]:
         """Turn keep-attached on or off. When on, the manager re-attaches the device when it drops
-        (for example after a board resets or a debugger re-enumerates). Needs the GUI server to run."""
+        (for example after a board resets or a debugger re-enumerates). Needs the desktop app or
+        `setup-manager daemon` to run on this PC."""
         return await _call(lambda f: f.set_sticky(setup, busid, enabled))
 
     @mcp.tool()

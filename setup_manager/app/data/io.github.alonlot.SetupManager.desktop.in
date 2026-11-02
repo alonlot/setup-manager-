@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Setup Manager
+GenericName=USB/IP Lab Manager
+Comment=Status, USB/IP devices and shells of your setup PCs
+Exec=@EXEC@ app
+Icon=io.github.alonlot.SetupManager
+Terminal=false
+Categories=Development;Electronics;System;
+Keywords=usb;usbip;embedded;lab;setup;debugger;
+StartupNotify=true
+StartupWMClass=io.github.alonlot.SetupManager

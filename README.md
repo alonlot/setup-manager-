@@ -1,14 +1,15 @@
 # Setup Manager
 
-Setup Manager controls a group of Linux "setup PCs" that you use for embedded
-development. Each setup PC shares its USB devices (debug probes, serial
-adapters, boards) over USB/IP. With Setup Manager, you can:
+Setup Manager is an Ubuntu desktop app that controls a group of Linux "setup
+PCs" that you use for embedded development. Each setup PC shares its USB
+devices (debug probes, serial adapters, boards) over USB/IP. With Setup
+Manager, you can:
 
 - See the status of all setup PCs (online, CPU, memory, disk, IPs, usbipd).
 - See the USB devices of each PC, with their tty names and USB/IP state.
 - Attach a device to your PC with one click (usbip bind + usbip attach).
-- Keep a device attached. The manager attaches it again after a board reset.
-- Open a shell on a setup PC in the browser, or run one command on many PCs.
+- Keep a device attached. The app attaches it again after a board reset.
+- Open real terminal tabs on a setup PC, or run one command on many PCs.
 - Let AI agents do all of this through an MCP server.
 
 ![USB devices](docs/usb.png)
@@ -16,9 +17,9 @@ adapters, boards) over USB/IP. With Setup Manager, you can:
 ## Parts
 
 ```
- your PC (manager)                                setup PC (one agent on each)
+ your Ubuntu PC                                   setup PC (one agent on each)
  +-----------------------------+   HTTP + WS     +-------------------------------+
- | setup-manager serve  (GUI)  | --------------> | setup_agent.py  (systemd)     |
+ | Setup Manager app (GTK 4)   | --------------> | setup_agent.py  (systemd)     |
  | setup-manager mcp    (MCP)  |   token auth    |   status, USB list, bind,     |
  | setup-manager <cli>         |   port 8765     |   exec, PTY shell             |
  |                             |                 |                               |
@@ -28,51 +29,45 @@ adapters, boards) over USB/IP. With Setup Manager, you can:
 
 | Part | Runs on | What it is |
 |---|---|---|
-| Agent | each setup PC | `setup_manager/agent/setup_agent.py`. One file. Python 3.8+ standard library only. Runs as root (USB bind needs root) from systemd. |
-| Manager | your PC | Python package `setup-manager`. Web GUI, REST API, CLI and MCP server. The local `usbip attach` runs here. |
+| Agent | each setup PC | `setup_manager/agent/setup_agent.py`. One file. Python 3.8+ standard library only. Runs as root (USB bind needs root) from systemd and starts at boot. |
+| App | your Ubuntu PC | A native GTK 4 + libadwaita app. The terminal tabs use VTE (the terminal of GNOME Terminal). The local `usbip attach` runs here. |
+| CLI and MCP | your Ubuntu PC | The `setup-manager` command. Same logic as the app. |
 
-The GUI, the CLI and the MCP server use the same config file:
-`~/.config/setup-manager/config.json` (`%APPDATA%\setup-manager\config.json` on Windows).
+The app, the CLI and the MCP server use the same config file:
+`~/.config/setup-manager/config.json`.
 
-## 1. Install the manager (your PC)
+## 1. Install the app (your Ubuntu PC)
 
-Requirements: Python 3.10+, and the usbip client.
-
-```bash
-git clone <this repo> setup-manager && cd setup-manager
-python3 -m venv ~/.venvs/setup-manager
-~/.venvs/setup-manager/bin/pip install .
-ln -s ~/.venvs/setup-manager/bin/setup-manager ~/.local/bin/   # optional
-```
-
-Install the usbip client and the `vhci-hcd` kernel module:
-
-- Debian: `sudo apt install usbip`
-- Ubuntu: `sudo apt install linux-tools-generic`
-- Fedora: `sudo dnf install usbip`
-- Arch: `sudo pacman -S usbip`
-- Windows: install [usbip-win2](https://github.com/vadimgrn/usbip-win2). Set `"local_usbip": {"command": "C:\\Program Files\\USBip\\usbip.exe"}` in the config. (Not tested yet.)
-
-`usbip attach` needs root. The manager runs `sudo -n usbip ...` when it is not root.
-Let your user run usbip without a password:
+Requirements: Ubuntu 24.04 or newer (libadwaita 1.5 or newer).
 
 ```bash
-echo "$USER ALL=(root) NOPASSWD: $(command -v usbip), $(command -v modprobe)" | sudo tee /etc/sudoers.d/setup-manager
-sudo chmod 440 /etc/sudoers.d/setup-manager
-echo vhci-hcd | sudo tee /etc/modules-load.d/vhci-hcd.conf && sudo modprobe vhci-hcd
+git clone https://github.com/alonlot/setup-manager- setup-manager
+cd setup-manager
+./install-app.sh
 ```
+
+Run it as your normal user (not with sudo). It asks for your sudo password. The script:
+
+- Installs the system packages: GTK 4, libadwaita, VTE, PyGObject, and the usbip client (`linux-tools-generic`).
+- Makes a Python venv in `~/.local/share/setup-manager/venv` that uses the system GTK bindings.
+- Installs the command `~/.local/bin/setup-manager`.
+- Adds **Setup Manager** to the app menu (with an icon).
+- Adds a sudo rule (`/etc/sudoers.d/setup-manager`). The rule lets you run `usbip` and `modprobe vhci-hcd` without a password, because `usbip attach` needs root.
+- Loads the `vhci-hcd` kernel module now and at boot.
+
+Run `./install-app.sh` again to upgrade. Use `./install-app.sh --uninstall` to remove it (your config is kept).
 
 ## 2. Install the agent (each setup PC)
 
-### From the manager, over SSH (recommended)
+### From your PC, over SSH (recommended)
 
 ```bash
 setup-manager deploy dev@192.168.1.20 --name bench-1 --install-deps
 ```
 
 This copies the agent to the PC, runs the installer with sudo, and adds the
-setup to the manager config with its token. To use one token for all setups,
-set `agent_defaults.token` in the manager config first, or give `--token`.
+setup to the app with its token. To use one token for all setups, set the
+default agent token in **Preferences** first, or give `--token`.
 Repeat for each setup PC.
 
 ### By hand
@@ -97,23 +92,26 @@ Run `install.sh` again to upgrade. It keeps the existing config. To remove: `sud
 
 Check the agent on the setup PC: `systemctl status setup-agent` and `journalctl -u setup-agent -f`.
 
-## 3. Start the GUI
+## 3. Use the app
 
-```bash
-setup-manager            # same as: setup-manager serve
-```
+Open **Setup Manager** from the app menu, or run `setup-manager`.
+Add setups with **+** (host and token) or with **Scan network** in the main menu
+(UDP broadcast, same subnet only).
 
-Open <http://localhost:8800/>. Add setups with **+ Add setup** (host, token) or
-with **Scan network** (UDP broadcast, same subnet only).
-
-| Page | What you can do |
+| Place | What you can do |
 |---|---|
-| Overview | All setups with CPU and RAM. The devices attached to your PC, with Detach. The keep-attached list. |
-| USB devices | One row per device: state, name, vid:pid, serial, tty names, drivers. **Attach** shares the device and attaches it to your PC. **Detach** detaches it and stops sharing. The `...` menu: share only, stop sharing, detach and keep shared, keep attached, auto-share when plugged, USB reset, copy busid. |
-| Terminal | A full interactive shell (xterm.js) on the setup PC. **Pop out** opens it in a new window. The session stays open when you change tabs. |
-| Run | Run one command with a timeout. Quick commands and history. **Run on many** runs a command on many setups at the same time. |
-| Info / Agent log | System details, and the recent log lines of the agent. |
-| Search (top bar) | Find a device on all setups by name, vid:pid, serial or tty. |
+| Overview | All setups with CPU, RAM and USB counts. The devices attached to your PC, with Detach. The keep-attached list. |
+| Setup > USB | One row per device: state, name, vid:pid, serial, tty names, drivers. **Attach** shares the device and attaches it to your PC. **Detach** detaches it and stops sharing. The **⋮** menu: share only, stop sharing, detach and keep shared, keep attached, auto-share when plugged, USB reset, copy bus ID, copy the usbip command. |
+| Setup > Terminal | Real terminal tabs (VTE) on the setup PC. **+** opens a new tab. A tab stays open when you go to other pages. Ctrl+Shift+C / Ctrl+Shift+V copy and paste. Ctrl +/- zooms. |
+| Setup > Run | Run one command with a timeout and an optional user. Quick commands (right-click a quick command to remove it). |
+| Setup > Info / Log | System details, and the recent log lines of the agent. |
+| Find device | Find a device on all setups by name, vid:pid, serial or tty. |
+| Run on many | Run one command on many setups at the same time. |
+| Preferences (Ctrl+,) | Default agent token and port, refresh interval, the local usbip command and sudo. |
+
+Keyboard: Ctrl+N add setup, Ctrl+R or F5 refresh, Ctrl+Q quit.
+
+![Overview](docs/overview.png)
 
 Device states:
 
@@ -129,25 +127,27 @@ Device states:
 Debug probes and boards often re-enumerate (after flashing, after a reset).
 Then the USB/IP connection drops.
 
-- **Keep attached** (manager side): every 4 seconds, the manager checks the device and attaches it again when it is missing. It follows the device by serial number when it moves to a different USB port. The GUI server must run for this. A manual Detach turns it off.
-- **Auto-share when plugged** (agent side): the agent binds matching devices by itself when they are plugged in. Rules are stored in the agent config (`auto_bind`).
+- **Keep attached** (your PC): every 4 seconds, the app checks the device and attaches it again when it is missing. It follows the device by serial number when it moves to a different USB port. This works while the app is open. To keep it without the app, run `setup-manager daemon` (for example as a systemd user service). Do not run the app and the daemon at the same time. A manual Detach turns keep-attached off.
+- **Auto-share when plugged** (setup PC): the agent binds matching devices by itself when they are plugged in. The rules are in the agent config (`auto_bind`).
 
 Use the two together for a hands-off setup.
 
 ### Safety rules in the agent
 
-- The agent does not bind a device that has a network interface (a USB Ethernet adapter can be the only link to the PC), a hub, or a device in `protected`, unless you use force.
+- The agent does not bind a device that has a network interface (a USB Ethernet adapter can be the only link to the PC), a hub, or a device in `protected`. The app asks before it forces this.
 - Rule format for `auto_bind` and `protected`: `1-1.2` (busid), `0483:374b` (vid:pid), `0483:*`, `0483:374b:SERIAL`.
+
+![Terminal](docs/terminal.png)
 
 ## 4. Connect AI agents (MCP)
 
-The MCP server uses the same config and the same logic as the GUI. Devices
+The MCP server uses the same config and the same logic as the app. Devices
 attach to the PC where the MCP server runs.
 
 Claude Code:
 
 ```bash
-claude mcp add setup-manager -- ~/.venvs/setup-manager/bin/setup-manager mcp
+claude mcp add setup-manager -- ~/.local/bin/setup-manager mcp
 ```
 
 Claude Desktop, Cursor and other clients (stdio):
@@ -156,7 +156,7 @@ Claude Desktop, Cursor and other clients (stdio):
 {
   "mcpServers": {
     "setup-manager": {
-      "command": "/home/you/.venvs/setup-manager/bin/setup-manager",
+      "command": "/home/you/.local/bin/setup-manager",
       "args": ["mcp"]
     }
   }
@@ -186,15 +186,18 @@ flash build/fw.elf with openocd, then detach it."*
 ## CLI
 
 ```bash
+setup-manager                            # open the app
 setup-manager list                       # setups and state
 setup-manager usb bench-1                # USB devices
 setup-manager attach bench-1 1-1.2       # bind + attach here
 setup-manager detach bench-1 1-1.2       # detach + unbind (--keep-bound to keep it shared)
 setup-manager attached                   # devices attached to this PC
+setup-manager shell bench-1              # interactive shell in this terminal (like ssh)
 setup-manager exec bench-1 'dmesg | tail -n 20'
 setup-manager exec all -- uptime         # on every setup
 setup-manager discover                   # find agents with UDP broadcast
 setup-manager add 192.168.1.21 --name bench-2 --token ...
+setup-manager daemon                     # keep-attached without the app
 setup-manager --json usb bench-1         # JSON output for scripts
 ```
 
@@ -202,14 +205,10 @@ A setup can be given by id, name or host.
 
 ## Configuration
 
-Manager (`~/.config/setup-manager/config.json`). All keys are optional:
+App (`~/.config/setup-manager/config.json`). You can change most values in the app. All keys are optional:
 
 ```json
 {
-  "listen": "127.0.0.1",
-  "port": 8800,
-  "token": "",
-  "allowed_hosts": [],
   "agent_defaults": { "port": 8765, "token": "one-token-for-all-agents" },
   "local_usbip": { "command": null, "sudo": null },
   "poll_interval": 5,
@@ -229,21 +228,21 @@ Restart after a change: `sudo systemctl restart setup-agent`.
 
 Read this before you use it on a shared network.
 
-- The agent gives a **root-level** API (USB control and shell) to everyone who has its token. Keep the token secret. Each agent can have its own token.
-- Without TLS, the token and the shell traffic go over the network as plain text. Use `--tls` on the agent (self-signed certificate) and `"tls": true` for the setup. Or use the agents only on a lab network that you trust.
+- The agent gives a **root-level** API (USB control and shell) to everyone who has its token. Keep the token secret. Each agent can have its own token. The config file of the app has mode 600.
+- Without TLS, the token and the shell traffic go over the network as plain text. Use `--tls` on the agent (self-signed certificate) and turn on TLS for the setup in the app. Or use the agents only on a lab network that you trust.
 - USB/IP (port 3240) has no authentication and no encryption. This is a limit of USB/IP. Anyone who can reach port 3240 can attach a shared device. Share devices only on a trusted network, or limit port 3240 with a firewall to your PC's IP.
-- The manager listens on 127.0.0.1 by default. If you set `listen` to a network address, set `token` too. The manager blocks cross-site requests from other web pages and DNS rebinding.
-- The MCP server can do everything the GUI can do. Give it only to agents that you trust with your lab.
+- The MCP server can do everything the app can do. Give it only to agents that you trust with your lab.
 
 ## Troubleshooting
 
 | Problem | What to do |
 |---|---|
-| Setup is offline | On the setup PC: `systemctl status setup-agent`. Check the firewall (8765/tcp). Check host and port in the manager. |
-| "agent rejected the token" | The token in the manager does not match `/etc/setup-agent/config.json`. |
-| "usbipd is not running" | Click **Start usbipd**, or `sudo systemctl restart setup-usbipd` on the setup PC. |
+| The app does not start: "cannot start the desktop app" | Run `./install-app.sh` again. It installs GTK 4, libadwaita and VTE for the system Python. |
+| Setup is offline | On the setup PC: `systemctl status setup-agent`. Check the firewall (8765/tcp). Check host and port in the app. |
+| "agent rejected the token" | The token in the app does not match `/etc/setup-agent/config.json`. |
+| "usbipd is not running" | Click **Start usbipd** in the banner, or `sudo systemctl restart setup-usbipd` on the setup PC. |
 | usbip not found on the setup PC | Ubuntu: `sudo apt install linux-tools-generic linux-tools-$(uname -r)`. Debian: `sudo apt install usbip`. |
-| Attach fails with "password is required" | Add the sudoers rule from step 1. |
+| Attach fails with "password is required" | Run `./install-app.sh` again (it adds the sudo rule). |
 | Attach fails with "open vhci_driver" | `sudo modprobe vhci-hcd` on your PC. |
 | Attach times out | Port 3240/tcp on the setup PC is blocked. |
 | Scan network finds nothing | Discovery uses UDP broadcast and works only in one subnet. Add the setups by IP. |
@@ -251,11 +250,13 @@ Read this before you use it on a shared network.
 ## Development
 
 ```bash
-pip install -e '.[test]'
-pytest
+python3 -m venv --system-site-packages .venv   # system Python, for the GTK bindings
+.venv/bin/pip install -e '.[test]'
+.venv/bin/pytest
 ```
 
 The tests run a real agent process against a fake sysfs tree with fake `usbip`
-programs (`tests/fakes/`). They test the agent API, the manager, the REST API,
-the WebSocket shell and the MCP server, without USB hardware or root.
+programs (`tests/fakes/`). They test the agent API, the manager logic, the
+shell client in a real pseudo-terminal and the MCP server, without USB
+hardware or root. The app smoke test runs only when a display is available.
 The MCP server works with the `mcp` package 1.x and 2.x.

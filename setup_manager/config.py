@@ -1,7 +1,7 @@
 """Manager configuration: the list of setups, sticky attachments and local settings.
 
 The config is one JSON file (default ~/.config/setup-manager/config.json, or
-$SETUP_MANAGER_HOME/config.json). The GUI, the CLI and the MCP server share it.
+$SETUP_MANAGER_HOME/config.json). The app, the CLI and the MCP server share it.
 Each process reloads it when the file changes on disk.
 """
 
@@ -16,12 +16,6 @@ from pathlib import Path
 from typing import Any
 
 DEFAULTS: dict[str, Any] = {
-    "listen": "127.0.0.1",
-    "port": 8800,
-    # Token for the manager web UI / REST API. Empty = no auth (only safe on 127.0.0.1).
-    "token": "",
-    # Extra Host names allowed for the web UI (e.g. "lab-pc.local"), besides localhost and "listen".
-    "allowed_hosts": [],
     # Defaults for setups that do not set their own port / token.
     "agent_defaults": {"port": 8765, "token": ""},
     # Local usbip client. command: null = "usbip" ("usbip.exe" on Windows).
@@ -32,6 +26,9 @@ DEFAULTS: dict[str, Any] = {
     "discovery_targets": ["255.255.255.255"],
     "setups": [],
     "sticky": [],
+    # Quick commands in the Run tab of the app.
+    "snippets": ["uname -a", "lsusb", "ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null", "dmesg | tail -n 40",
+                 "usbip list -l", "uptime", "df -h /"],
 }
 
 SETUP_FIELDS = {"name", "host", "port", "token", "tls", "verify_tls", "notes", "tags", "usbip_port"}

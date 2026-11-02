@@ -2,12 +2,8 @@
 import asyncio
 import json
 
-import aiohttp
-from aiohttp.test_utils import TestClient, TestServer
-
 from setup_manager.config import ConfigStore
 from setup_manager.fleet import Fleet, FleetError
-from setup_manager.web import build_app
 
 
 def run(coro):
@@ -100,115 +96,4 @@ def test_offline_setup(tmp_path):
                 await f.status("nope")
             except FleetError as err:
                 assert err.status == 404
-    run(go())
-
-
-def test_web_api_and_shell(manager_config):
-    async def go():
-        fleet = Fleet(ConfigStore(manager_config))
-        await fleet.open()
-        app = build_app(fleet, background=False)
-        async with TestClient(TestServer(app)) as client:
-            r = await client.get("/")
-            assert r.status == 200 and "Setup Manager" in await r.text()
-            r = await client.get("/static/app.js")
-            assert r.status == 200
-
-            await fleet.refresh_all()
-            ov = await (await client.get("/api/overview")).json()
-            assert ov["setups"][0]["online"] and ov["setups"][0]["has_token"] and "token" not in ov["setups"][0]
-
-            r = await client.post("/api/setups/bench/usb/1-2/attach", json={})
-            assert r.status == 200, await r.text()
-            local = await (await client.get("/api/local")).json()
-            assert local["ports"][0]["busid"] == "1-2"
-            r = await client.post("/api/setups/bench/usb/1-2/detach", json={})
-            assert r.status == 200
-            r = await client.post("/api/setups/bench/usb/1-2/nope", json={})
-            assert r.status == 404
-            r = await client.post("/api/setups/bench/exec", json={"command": "echo web"})
-            assert (await r.json())["stdout"] == "web\n"
-
-            r = await client.post("/api/setups", json={"name": "Second Bench", "host": "127.0.0.2", "port": 1})
-            data = await r.json()
-            assert data["setup"]["id"] == "second-bench" and data["online"] is False
-            r = await client.put("/api/setups/second-bench", json={"notes": "rack 2"})
-            assert (await r.json())["setup"]["notes"] == "rack 2"
-            assert (await client.delete("/api/setups/second-bench")).status == 200
-
-            # Interactive shell through the manager proxy.
-            ws = await client.ws_connect("/api/setups/bench/shell?cols=100&rows=30")
-            await ws.send_str(json.dumps({"t": "i", "d": "stty size; echo MARK$((1+1))\n"}))
-            buf = b""
-            for _ in range(100):
-                msg = await asyncio.wait_for(ws.receive(), 10)
-                if msg.type == aiohttp.WSMsgType.BINARY:
-                    buf += msg.data
-                if b"MARK2" in buf and b"30 100" in buf:
-                    break
-            assert b"MARK2" in buf and b"30 100" in buf, buf
-            await ws.send_str(json.dumps({"t": "r", "c": 120, "r": 40}))
-            await ws.send_str(json.dumps({"t": "i", "d": "stty size\n"}))
-            buf = b""
-            for _ in range(100):
-                msg = await asyncio.wait_for(ws.receive(), 10)
-                if msg.type == aiohttp.WSMsgType.BINARY:
-                    buf += msg.data
-                if b"40 120" in buf:
-                    break
-            assert b"40 120" in buf
-            await ws.send_str(json.dumps({"t": "i", "d": "exit\n"}))
-            got_exit = False
-            for _ in range(100):
-                msg = await asyncio.wait_for(ws.receive(), 10)
-                if msg.type == aiohttp.WSMsgType.TEXT and json.loads(msg.data).get("t") == "exit":
-                    got_exit = True
-                if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
-                    break
-            assert got_exit
-            await ws.close()
-        await fleet.close()
-    run(go())
-
-
-def test_manager_token(manager_config):
-    data = json.loads(manager_config.read_text())
-    data["token"] = "mgr-secret"
-    manager_config.write_text(json.dumps(data))
-
-    async def go():
-        fleet = Fleet(ConfigStore(manager_config))
-        await fleet.open()
-        async with TestClient(TestServer(build_app(fleet, background=False))) as client:
-            assert (await client.get("/api/setups")).status == 401
-            assert (await client.get("/")).status == 200
-            assert (await client.post("/api/login", json={"token": "bad"})).status == 401
-            assert (await client.post("/api/login", json={"token": "mgr-secret"})).status == 200
-            assert (await client.get("/api/setups")).status == 200  # cookie
-        await fleet.close()
-    run(go())
-
-
-def test_cross_site_blocked(manager_config):
-    async def go():
-        fleet = Fleet(ConfigStore(manager_config))
-        await fleet.open()
-        async with TestClient(TestServer(build_app(fleet, background=False))) as client:
-            evil = {"Origin": "http://evil.example"}
-            r = await client.post("/api/setups/bench/exec", json={"command": "id"}, headers=evil)
-            assert r.status == 403
-            r = await client.post("/api/setups/bench/exec", data='{"command": "id"}',
-                                  headers={"Content-Type": "text/plain"})
-            assert r.status == 415
-            r = await client.get("/api/setups", headers={"Host": "attacker.example:8800"})
-            assert r.status == 403  # DNS rebinding
-            try:
-                await client.ws_connect("/api/setups/bench/shell", headers=evil)
-                raise AssertionError("cross-site websocket accepted")
-            except aiohttp.WSServerHandshakeError as e:
-                assert e.status == 403
-            host = f"{client.host}:{client.port}"
-            r = await client.get("/api/setups", headers={"Origin": f"http://{host}"})
-            assert r.status == 200
-        await fleet.close()
     run(go())

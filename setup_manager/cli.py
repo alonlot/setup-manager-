@@ -134,10 +134,38 @@ def cmd_discover(args: argparse.Namespace) -> None:
         print(f"{a['host']:<16} port {a.get('port')}  {a.get('name')}  v{a.get('version')}{known}")
 
 
-def cmd_serve(args: argparse.Namespace) -> None:
-    from .web import serve
-    data = STORE.data()
-    serve(Fleet(STORE), args.listen or data.get("listen", "127.0.0.1"), args.port or int(data.get("port", 8800)))
+def cmd_app(args: argparse.Namespace) -> None:
+    try:
+        from .app.main import run_app
+    except (ImportError, ValueError) as e:
+        print(f"cannot start the desktop app: {e}\n"
+              "Install GTK4, libadwaita and VTE for Python:\n"
+              "  sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-vte-3.91\n"
+              "and use a Python that sees them (see install-app.sh).", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(run_app(STORE))
+
+
+def cmd_shell(args: argparse.Namespace) -> None:
+    from .shell_client import run_shell
+    logging.getLogger().setLevel(logging.WARNING)
+    sys.exit(run_shell(STORE, args.setup, args.user))
+
+
+def cmd_daemon(args: argparse.Namespace) -> None:
+    """Keep-attached and polling without the app (for example as a systemd user service)."""
+    async def go() -> None:
+        fleet = Fleet(STORE)
+        await fleet.start_background()
+        logging.info("setup-manager daemon running (keep-attached: %d devices)", len(STORE.sticky()))
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await fleet.close()
+    try:
+        asyncio.run(go())
+    except KeyboardInterrupt:
+        pass
 
 
 def cmd_mcp(args: argparse.Namespace) -> None:
@@ -215,10 +243,16 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--version", action="version", version=__version__)
     sub = ap.add_subparsers(dest="cmd")
 
-    p = sub.add_parser("serve", help="run the GUI web server (default command)")
-    p.add_argument("--listen")
-    p.add_argument("--port", type=int)
-    p.set_defaults(fn=cmd_serve)
+    p = sub.add_parser("app", help="open the desktop app (default command)")
+    p.set_defaults(fn=cmd_app)
+
+    p = sub.add_parser("shell", help="interactive shell on a setup, in this terminal")
+    p.add_argument("setup")
+    p.add_argument("--user", help="log in as this user (default: the setup's run_as user)")
+    p.set_defaults(fn=cmd_shell)
+
+    p = sub.add_parser("daemon", help="keep-attached and polling without the app")
+    p.set_defaults(fn=cmd_daemon)
 
     p = sub.add_parser("mcp", help="run the MCP server for AI agents (stdio by default)")
     p.add_argument("--http", action="store_true", help="streamable HTTP instead of stdio")
@@ -291,7 +325,7 @@ def main(argv: list[str] | None = None) -> None:
                         stream=sys.stderr)
     STORE = ConfigStore(args.config or os.environ.get("SETUP_MANAGER_CONFIG"))
     if not getattr(args, "fn", None):
-        args = ap.parse_args((argv if argv is not None else sys.argv[1:]) + ["serve"])
+        args = ap.parse_args((argv if argv is not None else sys.argv[1:]) + ["app"])
     if args.cmd == "exec" and not args.command:
         ap.error("exec needs a command")
     if args.cmd == "exec" and args.command[:1] == ["--"]:

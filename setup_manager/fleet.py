@@ -169,6 +169,12 @@ class Fleet:
             })
         return out
 
+    async def snapshot(self) -> dict[str, Any]:
+        """Everything the app shows on the overview, in one call."""
+        ports = await self.local_ports()
+        return {"setups": self.summaries(), "ports": ports, "sticky": self.sticky_report(),
+                "usbip": self.local.info()}
+
     # -- local attachments -----------------------------------------------------
     async def local_ports(self) -> list[dict[str, Any]]:
         """Devices attached to this PC, each tagged with the setup it comes from."""
