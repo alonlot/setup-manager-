@@ -1,0 +1,11 @@
+{
+  "name": "bench-1",
+  "listen": "0.0.0.0",
+  "port": 8765,
+  "token": "CHANGE-ME (python3 setup_agent.py --gen-token)",
+  "run_as": "dev",
+  "auto_bind": ["0483:374b", "1366:*"],
+  "protected": ["046d:c52b"],
+  "tls_cert": "",
+  "tls_key": ""
+}

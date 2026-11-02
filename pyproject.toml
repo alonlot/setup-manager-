@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "setup-manager"
+version = "0.1.0"
+description = "Manage Linux setup PCs: status, USB/IP bind and attach, remote shell, with a web GUI and an MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "aiohttp>=3.9",
+  "mcp>=1.2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+setup-manager = "setup_manager.cli:main"
+
+[tool.setuptools]
+packages = ["setup_manager", "setup_manager.agent"]
+
+[tool.setuptools.package-data]
+setup_manager = ["static/*", "static/vendor/*"]
+"setup_manager.agent" = ["*.sh", "*.service", "*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

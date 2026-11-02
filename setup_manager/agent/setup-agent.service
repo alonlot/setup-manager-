@@ -1,0 +1,15 @@
+[Unit]
+Description=Setup Manager agent (USB/IP, status, remote shell)
+After=network-online.target setup-usbipd.service
+Wants=network-online.target setup-usbipd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/setup-agent/setup_agent.py --config /etc/setup-agent/config.json
+Restart=always
+RestartSec=3
+# Keep shells and usbipd alive when only the agent restarts.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

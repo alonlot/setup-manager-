@@ -1,0 +1,14 @@
+[Unit]
+Description=USB/IP host daemon (for Setup Manager)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=-/sbin/modprobe usbip-host
+ExecStart=/usr/bin/env usbipd
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
