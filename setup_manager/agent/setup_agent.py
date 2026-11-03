@@ -24,6 +24,8 @@ API (all routes except /api/ping need "Authorization: Bearer <token>"):
   POST /api/serial/open {busid | tty, baud}      GET /api/serial/read?busid|tty&since&wait&max
   POST /api/serial/write {busid | tty, data | data_b64}   POST /api/serial/reset | close
   PUT  /api/files?path=   (body = the file)      GET /api/files?path=   GET /api/files/list?path=
+  POST /api/reserve {busid, owner, ttl[, lease]}  POST /api/release {busid, lease | force}
+  GET  /api/reservations   (while a device is reserved, changes to it need header X-SM-Lease)
   POST /api/usbipd/start
   POST /api/exec        {command, timeout, cwd, user}
   GET  /api/shell?cols=&rows=&user=  WebSocket, interactive PTY shell
@@ -59,7 +61,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_CONFIG_PATH = "/etc/setup-agent/config.json"
 DISCOVERY_MAGIC = b"SETUP-MANAGER-DISCOVER"
 BUSID_RE = re.compile(r"^\d+-\d+(\.\d+)*$")
@@ -1590,6 +1592,8 @@ class Agent:
         self.identify_locks = {}
         self.hub = SerialHub(float(cfg.get("serial_idle_timeout") or 900))
         self.claims = {}
+        self.reservations = {}
+        self.res_lock = threading.Lock()
 
     # -- API handlers ----------------------------------------------------------
     def ping(self):
@@ -1633,6 +1637,7 @@ class Agent:
         include_hubs = qs.get("all", ["0"])[0] in ("1", "true", "yes")
         devices = self.usb.list(include_hubs=include_hubs)
         self.annotate_users(devices)
+        self.annotate_reservations(devices)
         return {"devices": devices, "usbip": self.usb.usbip_info()}
 
     def annotate_users(self, devices):
@@ -1663,6 +1668,93 @@ class Agent:
 
     def release(self, body):
         return {"released": bool(self.claims.pop(body.get("busid"), None))}
+
+    # -- reservations (locks for automation) ----------------------------------------
+    # A reservation is a lock on one device, with an owner, a lease (secret) and an
+    # expiry time. Only while a device is reserved, the actions on it that change it
+    # (bind, unbind, reset, identify, flash, serial write/reset) need the lease
+    # (header X-SM-Lease). Devices that are not reserved work as before.
+    def _res_key(self, dev):
+        return device_rule(dev).lower()
+
+    def _active(self, key):
+        r = self.reservations.get(key)
+        if r and r["expires"] < time.time():
+            self.reservations.pop(key, None)
+            log.info("reservation of %s by %s expired", key, r["owner"])
+            return None
+        return r
+
+    @staticmethod
+    def _public(r):
+        return dict((k, v) for k, v in r.items() if k != "lease")
+
+    def annotate_reservations(self, devices):
+        with self.res_lock:
+            for d in devices:
+                r = self._active(self._res_key(d))
+                if r:
+                    d["reserved_by"] = self._public(r)
+
+    def reserve(self, body):
+        dev = self.usb.get(body.get("busid"))
+        owner = str(body.get("owner") or "").strip()[:80]
+        if not owner:
+            raise ApiError(400, "owner is required")
+        ttl = max(5.0, min(24 * 3600.0, float(body.get("ttl") or 300)))
+        key = self._res_key(dev)
+        with self.res_lock:
+            r = self._active(key)
+            if r and not (body.get("lease") and hmac.compare_digest(str(body["lease"]), r["lease"])):
+                raise ApiError(423, "%s is reserved by %s until %s" % (
+                    dev["busid"], r["owner"], time.strftime("%H:%M:%S", time.localtime(r["expires"]))))
+            if not r:
+                r = {"key": key, "busid": dev["busid"], "owner": owner, "lease": secrets.token_urlsafe(24),
+                     "at": time.time(), "note": str(body.get("note") or "")[:200]}
+                log.info("%s reserved by %s for %ds", dev["busid"], owner, ttl)
+            r["expires"] = time.time() + ttl
+            r["busid"] = dev["busid"]
+            self.reservations[key] = r
+            return dict(r)
+
+    def release_reservation(self, body):
+        dev = self.usb.get(body.get("busid")) if body.get("busid") else None
+        key = self._res_key(dev) if dev else str(body.get("key") or "")
+        with self.res_lock:
+            r = self._active(key)
+            if not r:
+                return {"released": False}
+            if not body.get("force") and not hmac.compare_digest(str(body.get("lease") or ""), r["lease"]):
+                raise ApiError(423, "the lease does not match the reservation of %s" % r["owner"])
+            self.reservations.pop(key, None)
+        log.info("reservation of %s by %s %s", key, r["owner"], "broken" if body.get("force") else "released")
+        return {"released": True, "owner": r["owner"]}
+
+    def list_reservations(self):
+        with self.res_lock:
+            return {"reservations": [self._public(r) for k, r in list(self.reservations.items())
+                                     if self._active(k)]}
+
+    def check_lease(self, busid, leases):
+        """Raise 423 when the device is reserved and none of the given leases is its lease."""
+        if not self.reservations or not busid:
+            return
+        try:
+            dev = self.usb.get(busid)
+        except ApiError:
+            return
+        with self.res_lock:
+            r = self._active(self._res_key(dev))
+        if r and not any(hmac.compare_digest(x, r["lease"]) for x in leases):
+            raise ApiError(423, "%s is reserved by %s until %s" % (
+                busid, r["owner"], time.strftime("%H:%M:%S", time.localtime(r["expires"]))))
+
+    def busid_for_tty(self, tty):
+        tty = os.path.basename(str(tty or ""))
+        for d in self.usb.list(include_hubs=True):
+            if tty in d["ttys"]:
+                return d["busid"]
+        return None
 
     def set_nickname(self, body):
         dev = self.usb.get(body.get("busid"))
@@ -1930,6 +2022,12 @@ class Agent:
                 time.sleep(1)
 
 
+# The actions that need the lease while a device is reserved.
+LEASE_ROUTES = {("POST", "/api/usb/bind"), ("POST", "/api/usb/unbind"), ("POST", "/api/usb/reset"),
+                ("POST", "/api/usb/identify"), ("POST", "/api/usb/flash"), ("POST", "/api/serial/write"),
+                ("POST", "/api/serial/reset")}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "setup-agent/" + VERSION
@@ -2061,6 +2159,9 @@ class Handler(BaseHTTPRequestHandler):
                 ("POST", "/api/serial/close"): lambda: a.hub.close(a.serial_path(body)),
                 ("GET", "/api/files/list"): lambda: a.files_list(qs),
                 ("POST", "/api/files/delete"): lambda: a.files_delete(body),
+                ("POST", "/api/reserve"): lambda: a.reserve(body),
+                ("POST", "/api/release"): lambda: a.release_reservation(body),
+                ("GET", "/api/reservations"): lambda: a.list_reservations(),
                 ("GET", "/api/identify/methods"): lambda: {"reset": RESET_METHODS, "bauds": AUTO_BAUDS},
                 ("POST", "/api/usbipd/start"): lambda: {"notes": a.usb.ensure_usbipd(), **a.usb.usbip_info()},
                 ("POST", "/api/exec"): lambda: run_command(a.cfg, body.get("command"), body.get("timeout", 60),
@@ -2069,6 +2170,12 @@ class Handler(BaseHTTPRequestHandler):
                 ("GET", "/api/config"): lambda: a.public_config(),
                 ("POST", "/api/config"): lambda: a.update_config(body),
             }
+            if a.reservations and (method, path) in LEASE_ROUTES:
+                busid = body.get("busid") or (a.busid_for_tty(body.get("tty")) if body.get("tty") else None)
+                leases = [x.strip() for x in self.headers.get("X-SM-Lease", "").split(",") if x.strip()]
+                if body.get("lease"):
+                    leases.append(str(body["lease"]))
+                a.check_lease(busid, leases)
             fn = routes.get((method, path))
             if fn is None:
                 return self._send_json(404, {"error": "not found: %s %s" % (method, path)})

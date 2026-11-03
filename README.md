@@ -12,6 +12,7 @@ Manager, you can:
 - Open real terminal tabs on a setup PC, or run one command on many PCs.
 - Reset a board, read its boot log and see which MCU it probably is, next to the device.
 - Watch the serial port of a board live, flash firmware, see who uses a device, and give devices names.
+- Automate it all from Python (scripts, CI, pytest), with reservations so that jobs do not use the same board.
 - Let AI agents do all of this through an MCP server.
 
 ![USB devices](docs/usb.png)
@@ -326,6 +327,80 @@ moves to the second line. The agent stores it with the USB serial number
 the same names. Search finds devices by nickname too.
 
 CLI: `setup-manager rename bench-1 1-1 Board A`.
+
+## Python library (automation)
+
+Use Setup Manager from your own Python code: scripts, CI jobs and pytest. It is
+another way to connect. It uses the same config file and the same setups as the
+app, and it changes nothing in the app, the CLI or the MCP server.
+
+```python
+from setup_manager import Lab
+
+with Lab() as lab:                                # Lab(config="lab.json") or Lab(setups=[{"host": ..., "token": ...}])
+    board = lab.device("Board A")                 # nickname, serial number, "bench-1:1-2", "0483:374b", or name words
+    with board.reserve(owner="ci-42", ttl=600, wait=120):   # a lock on the board
+        with board.serial(115200) as con:         # open before the flash, so you get the boot output
+            board.flash("build/zephyr.hex")       # the last profile of this board, or profile="...", env={...}
+            con.expect(r"boot OK", timeout=10)    # re.Match, or ExpectTimeout with the output
+            con.send("version")                   # CR LF is added; end="" for none
+            print(con.expect(r"v(\d+\.\d+)").group(1))
+    with board.attached():                        # attach to this PC, detach at the end (also on an error)
+        print(board.local_ttys)                   # for example ["/dev/ttyACM3"]
+    print(lab.setup("bench-1").run("uname -a").check().stdout)
+```
+
+| Object | Main methods and properties |
+|---|---|
+| `Lab` | `setups()`, `setup(ref)`, `devices(query, setup=)`, `device(ref, setup=)`, `reservations()`, `add_setup(host, token)`, `close()` |
+| `Setup` | `run(cmd, timeout, user, check)`, `upload()`, `download()`, `files()`, `status()`, `online()`, `devices()` |
+| `Device` | `reserve()`, `attach()`, `detach()`, `attached()`, `flash()`, `identify()`, `reset()`, `serial()`, `console`, `bind()`, `unbind()`, `usb_reset()`, `set_name()`, `refresh()`; `busid`, `display_name`, `serial_number`, `ttys`, `local_ttys`, `state`, `used_by`, `reserved_by`, `mcu` |
+| `SerialConsole` | `expect(regex, timeout)`, `send(text, end)`, `write(bytes)`, `read(timeout)`, `read_for(seconds)`, `lines()`, `clear()`, `log` |
+| Results | `CommandResult` (`ok`, `check()`), `FlashResult`, `IdentifyResult` |
+| Errors | `LabError`, `DeviceNotFound`, `AmbiguousDevice`, `BoardBusy`, `FlashFailed`, `CommandFailed`, `ExpectTimeout` |
+
+- The API is synchronous. It also works in Jupyter.
+- A `Device` follows the board by its USB serial number. When the board moves to another USB port, the next call finds it again.
+- `lab.device(...)` raises `AmbiguousDevice` (with the candidates) when more than one device matches.
+
+### Reservations
+
+`device.reserve()` locks a device on its setup PC. While it is reserved, only the
+owner can bind, unbind, reset, identify or flash it, or write to its serial
+port. This also applies to the app, the CLI and the MCP server: they get the
+error "reserved by ci-42 until 12:30". Everybody can still read the serial port.
+
+- The reservation renews itself while your program runs. If the program dies, it ends after `ttl` seconds.
+- `wait=` waits for a board that somebody else has. Without it, you get `BoardBusy` at once.
+- A device that is not reserved works as before.
+- A device that is already shared over USB/IP can still be attached with `usbip attach` by hand. USB/IP itself has no locks. Reserve a board before you share it.
+
+Reservations need agent 0.3.0 or newer: run `setup-manager deploy` again.
+
+### pytest
+
+The plugin is opt-in. Enable it with `-p setup_manager.pytest_plugin`, or with
+`pytest_plugins = ["setup_manager.pytest_plugin"]` in your `conftest.py`.
+
+```python
+import pytest
+
+@pytest.mark.board("Board A")                   # reserved for this test, released after it
+def test_boot(board):
+    board.flash("build/zephyr.hex")
+    board.console.expect("boot OK", timeout=10)
+```
+
+```bash
+pytest -p setup_manager.pytest_plugin tests/hil --lab-owner ci-runner-1 --lab-wait 600
+```
+
+- Fixtures: `lab` (one per session) and `board` (from the `board` marker).
+- Marker arguments: `board(ref, setup=None, reserve=True, ttl=600, wait=None, baud=115200)`.
+- Options: `--lab-config`, `--lab-owner`, `--lab-wait`.
+- When a test fails, the serial output of its boards is added to the pytest report.
+
+See `examples/flash_and_check.py` and `examples/test_hil_example.py`.
 
 ## 4. Connect AI agents (MCP)
 
