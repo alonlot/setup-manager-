@@ -92,7 +92,7 @@ def test_identify_auto_baud_and_rebind(manager_config, agent, fake_mcus):
             r = await f.identify("bench", "1-2", {"reset": "rts", "duration": 0.8, "script": START})
             cap = r["capture"]
             assert [a["baud"] for a in cap["attempts"]] == [115200, 74880], cap["attempts"]
-            assert cap["baud"] == 74880 and cap["attempts"][0]["readable"] < 0.5
+            assert cap["baud"] == 74880 and cap["attempts"][0]["readable"] < 0.5, cap["attempts"]
             assert any("modem lines not supported" in n for n in cap["notes"])  # a pty has no RTS
             assert r["guess"]["mcu"] == "ESP8266"
             devs = {d["busid"]: d for d in await f.usb("bench")}

@@ -6,7 +6,7 @@ import re
 import time
 from typing import TYPE_CHECKING, Any
 
-from gi.repository import Adw, Gtk, Pango
+from gi.repository import Adw, GLib, Gtk, Pango
 
 from ..agent.setup_agent import AUTO_BAUDS, RESET_METHODS
 from .widgets import clear, copy_text, pill
@@ -211,6 +211,7 @@ class IdentifyDialog(Adw.Dialog):
 
         dlg.connect("response", response)
         dlg.present(self)
+        GLib.idle_add(lambda: (entry.grab_focus(), False)[1])  # type at once
 
     def _delete_profile(self) -> None:
         name = self.profile_names[self.profile_row.get_selected()]

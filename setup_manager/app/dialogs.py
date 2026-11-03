@@ -159,10 +159,12 @@ def preferences_dialog(win: "MainWindow") -> None:
     port = Adw.SpinRow.new_with_range(1, 65535, 1)
     port.set_title("Default agent port")
     port.set_value(int(data["agent_defaults"].get("port") or 8765))
+    client = Adw.EntryRow(title=f"Your name for the setups (empty = {win.fleet.client_name})",
+                          text=data.get("client_name") or "")
     poll = Adw.SpinRow.new_with_range(1, 120, 1)
     poll.set_title("Refresh interval (seconds)")
     poll.set_value(float(data.get("poll_interval") or 5))
-    for r in (token, port, poll):
+    for r in (client, token, port, poll):
         agents.add(r)
     page.add(agents)
 
@@ -188,6 +190,7 @@ def preferences_dialog(win: "MainWindow") -> None:
     page.add(files)
 
     def closed(*_: Any) -> None:
+        data["client_name"] = client.get_text().strip()
         data["agent_defaults"]["token"] = token.get_text()
         data["agent_defaults"]["port"] = int(port.get_value())
         data["poll_interval"] = int(poll.get_value())

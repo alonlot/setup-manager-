@@ -47,6 +47,10 @@ def test_app_smoke(manager_config):
         from setup_manager.app.identify import IdentifyDialog
         dlg = IdentifyDialog(win, "bench", page.devices[0])
         seen["dialog"] = dlg.options()["reset"] == "auto" and "ESP32 / ESP8266" in dlg.profile_names
+        from setup_manager.app.flash import FlashDialog
+        fd = FlashDialog(win, "bench", page.devices[0])
+        seen["flash"] = fd.names[fd.profile_row.get_selected()] == "st-flash (STM32, ST-LINK)"
+        seen["serial_tab"] = page.stack.get_child_by_name("serial") is page.serial
         page.stack.set_visible_child_name("terminal")
         GLib.timeout_add(500, step3)
         return False
@@ -62,4 +66,4 @@ def test_app_smoke(manager_config):
     app.run([])
     assert seen["overview"] and seen["rows"] == ["bench"]
     assert seen["setup_page"] and seen["devices"] == ["1-1", "1-2", "1-3", "2-1.3"]
-    assert seen["usb_rows"] == 4 and seen["tabs"] == 1 and seen["dialog"]
+    assert seen["usb_rows"] == 4 and seen["tabs"] == 1 and seen["dialog"] and seen["flash"] and seen["serial_tab"]

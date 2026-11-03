@@ -254,7 +254,7 @@ class MainWindow(Adw.ApplicationWindow):
     def usb_action(self, sid: str, busid: str, action: str, d: dict[str, Any]) -> None:
         f = self.fleet
         key = f"{sid}/{busid}"
-        name = f"{d.get('name') or busid} ({busid})"
+        name = f"{d.get('nickname') or d.get('name') or busid} ({busid})"
         if action == "attach":
             if (d.get("net") or d.get("is_hub")) and not d.get("bound"):
                 confirm(self, "Attach this device?", f"{name} is a network adapter or a hub. Sharing it can "
@@ -263,7 +263,8 @@ class MainWindow(Adw.ApplicationWindow):
             else:
                 self.run_action(key, f.attach(sid, busid), f"Attached {name} to this PC")
         elif action == "take":
-            confirm(self, "Take over the device?", f"{name} is in use by another client. Taking it "
+            who = d.get("used_by_text") or "another client"
+            confirm(self, "Take over the device?", f"{name} is in use by {who}. Taking it "
                     "disconnects that client.", "Take over",
                     lambda: self.run_action(key, f.attach(sid, busid, True), f"Attached {name} to this PC"))
         elif action == "detach":
@@ -284,7 +285,8 @@ class MainWindow(Adw.ApplicationWindow):
                 self.run_action(key, bind(), f"Shared {name}")
         elif action == "unbind":
             if d.get("state") == "in_use" and not d.get("attached_here"):
-                confirm(self, "Stop sharing?", f"{name} is in use by another client. It loses the device.",
+                confirm(self, "Stop sharing?", f"{name} is in use by {d.get('used_by_text') or 'another client'}. "
+                        "It loses the device.",
                         "Stop sharing", lambda: self.run_action(key, f.unbind(sid, busid), f"Stopped sharing {name}"))
             else:
                 self.run_action(key, f.unbind(sid, busid), f"Stopped sharing {name}")
@@ -296,6 +298,16 @@ class MainWindow(Adw.ApplicationWindow):
             self.run_action(key, f.set_sticky(sid, busid, False))
         elif action == "autobind":
             self.run_action(key, f.set_auto_bind(sid, busid, not d.get("auto_bind")))
+        elif action == "serial":
+            page = self._page(f"setup:{sid}")
+            self.select_setup(sid)
+            if isinstance(page, SetupPage):
+                page.open_serial(busid)
+        elif action == "flash":
+            from .flash import FlashDialog
+            FlashDialog(self, sid, d).present(self)
+        elif action == "rename":
+            self._rename(sid, busid, d)
         elif action == "identify":
             from .identify import IdentifyDialog
             IdentifyDialog(self, sid, d).present(self)
@@ -306,6 +318,23 @@ class MainWindow(Adw.ApplicationWindow):
             s = self.store.get_setup(sid)
             copy_text(self, f"sudo usbip attach -r {s['host'] if s else sid} -b {busid}")
             self.toast("Command copied")
+
+    def _rename(self, sid: str, busid: str, d: dict[str, Any]) -> None:
+        entry = Gtk.Entry(text=d.get("nickname") or "", placeholder_text=d["name"], activates_default=True)
+        dlg = Adw.AlertDialog(heading="Rename device", body=f"{d['name']} (bus {busid}, {d['vidpid']}). The name is "
+                              "stored on the setup PC, so everybody sees it. Empty = no name.")
+        dlg.set_extra_child(entry)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("save", "Save")
+        dlg.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("save")
+
+        def response(_d: Any, r: str) -> None:
+            if r == "save":
+                self.run_action(f"{sid}/{busid}", self.fleet.set_nickname(sid, busid, entry.get_text().strip()))
+        dlg.connect("response", response)
+        dlg.present(self)
+        GLib.idle_add(lambda: (entry.grab_focus(), False)[1])  # type at once
 
     def after_identify(self, sid: str) -> None:
         """Show the new MCU label next to the device."""

@@ -25,7 +25,8 @@ def _is_error(result):
     return bool(getattr(result, "is_error", None) or getattr(result, "isError", None))
 
 
-def test_mcp_tools(manager_config):
+def test_mcp_tools(manager_config, agent, fake_mcus):
+    fake_mcus(agent["devfs"], "ttyACM0", "boot\r\n")
     params = StdioServerParameters(command=sys.executable, args=["-m", "setup_manager", "--config",
                                                                  str(manager_config), "mcp"],
                                    env=dict(os.environ, PYTHONPATH=str(ROOT)), cwd=str(ROOT))
@@ -49,6 +50,15 @@ def test_mcp_tools(manager_config):
                 r = _payload(await session.call_tool("run_command", {"setup": "bench", "command": "echo mcp"}))
                 assert r["stdout"] == "mcp\n"
                 assert "identify_mcu" in tools
+                assert {"serial_open", "serial_read", "serial_write", "serial_wait_for", "flash_firmware",
+                        "upload_file", "set_device_name"} <= tools
+                r = _payload(await session.call_tool("set_device_name", {"setup": "bench", "busid": "1-1",
+                                                                         "name": "Board A"}))
+                assert r["device"]["nickname"] == "Board A"
+                h = _payload(await session.call_tool("serial_open", {"setup": "bench", "busid": "1-1"}))
+                assert h["tty"] == "ttyACM0"
+                r = _payload(await session.call_tool("serial_read", {"setup": "bench", "busid": "1-1"}))
+                assert r["text"] == "" and r["connected"]
                 r = _payload(await session.call_tool("identify_mcu", {"setup": "bench", "busid": "1-3",
                                                                       "reset": "none", "duration": 0.5}))
                 assert r["capture"]["ttys"] == [] and "label" in r["guess"]

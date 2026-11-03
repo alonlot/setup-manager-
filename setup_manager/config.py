@@ -26,6 +26,11 @@ DEFAULTS: dict[str, Any] = {
     "discovery_targets": ["255.255.255.255"],
     "setups": [],
     "sticky": [],
+    # Your name for the setups ("in use by ..."). Empty = user@hostname.
+    "client_name": "",
+    # Flash: your own profiles and the last options per device.
+    "flash_profiles": {},
+    "flash_last": {},
     # MCU identification: your own profiles, the last options per device, the results per device.
     "identify_profiles": {},
     "identify_last": {},

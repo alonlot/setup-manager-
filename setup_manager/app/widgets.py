@@ -97,7 +97,12 @@ def device_row(win: "MainWindow", sid: str, d: dict[str, Any], show_setup: bool 
                on_menu: Callable[[bool], None] | None = None) -> Adw.ActionRow:
     """One USB device: state, name, details, the main button and a menu with all actions."""
     busy = f"{sid}/{d['busid']}" in win.busy
-    parts = [d["vidpid"]]
+    parts = []
+    if d["state"] == "in_use" and not d.get("attached_here"):
+        parts.append(f"in use by {d.get('used_by_text') or 'another client'}")
+    if d.get("nickname"):
+        parts.append(d["name"])
+    parts.append(d["vidpid"])
     if d.get("serial"):
         parts.append(f"SN {d['serial']}")
     parts.append(f"bus {d['busid']}")
@@ -105,9 +110,9 @@ def device_row(win: "MainWindow", sid: str, d: dict[str, Any], show_setup: bool 
     parts += [f"net {n}" for n in d.get("net", [])]
     drivers = sorted({i["driver"] for i in d.get("interfaces", []) if i.get("driver") not in (None, "usbip-host")})
     parts += drivers
-    title = d["name"]
+    title = d.get("nickname") or d["name"]
     if show_setup:
-        title = f"{d.get('setup_name') or sid}  ·  {d['name']}"
+        title = f"{d.get('setup_name') or sid}  ·  {title}"
     row = Adw.ActionRow(title=title, subtitle="  ·  ".join(parts), use_markup=False)
     row.set_subtitle_lines(2)
     color, label = device_state(d)
@@ -178,7 +183,10 @@ def device_row(win: "MainWindow", sid: str, d: dict[str, Any], show_setup: bool 
     item("Keep attached here", "sticky", "view-pin-symbolic", bool(d.get("sticky")))
     item("Auto-share when plugged", "autobind", "emblem-synchronizing-symbolic", bool(d.get("auto_bind")))
     menu.append(Gtk.Separator())
+    item("Serial monitor", "serial", "network-transmit-receive-symbolic")
+    item("Flash firmware…", "flash", "document-send-symbolic")
     item("Identify MCU…", "identify", "dialog-question-symbolic")
+    item("Rename…", "rename", "document-edit-symbolic")
     item("USB reset (re-plug)", "reset", "view-refresh-symbolic")
     item("Copy bus ID", "copy-busid", "edit-copy-symbolic")
     item("Copy usbip attach command", "copy-attach", "edit-copy-symbolic")

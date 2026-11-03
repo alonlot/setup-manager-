@@ -11,6 +11,7 @@ Manager, you can:
 - Keep a device attached. The app attaches it again after a board reset.
 - Open real terminal tabs on a setup PC, or run one command on many PCs.
 - Reset a board, read its boot log and see which MCU it probably is, next to the device.
+- Watch the serial port of a board live, flash firmware, see who uses a device, and give devices names.
 - Let AI agents do all of this through an MCP server.
 
 ![USB devices](docs/usb.png)
@@ -92,6 +93,9 @@ Options: `--token`, `--port`, `--run-as USER`, `--auto-bind RULE`, `--protect RU
 Run `install.sh` again to upgrade. It keeps the existing config. To remove: `sudo ./uninstall.sh [--purge]`.
 
 Check the agent on the setup PC: `systemctl status setup-agent` and `journalctl -u setup-agent -f`.
+
+When you update Setup Manager, update the agents too (run `setup-manager deploy` again). An old agent
+does not have the new features: the app then says "the agent on ... is too old for this".
 
 ## 3. Use the app
 
@@ -251,6 +255,78 @@ The installers add the shell user to the `dialout` group, so that the scripts ca
 - `rts` and `dtr` reset only work when the board connects these lines to reset (most ESP32 and Arduino boards do).
 - `probe` needs `st-flash`/`st-info` (package `stlink-tools`) or `pyocd` on the PC that runs it.
 
+## Serial monitor
+
+Open the **Serial** tab of a setup, or select **Serial monitor** in the **⋮**
+menu of a device. Select the port and the baud rate, then click **Open**.
+
+- The agent keeps the port open and records it (2 MB per port). The app, the CLI and your AI agents can read the same port at the same time. Each reader has its own position.
+- When the board re-enumerates (after a flash or a reset), the port opens again by itself. The log shows `[port disconnected]` and `[reconnected]`.
+- Type in the black area, or in the line field below it. Select what Enter sends (CR, LF, CR LF).
+- Buttons: reset the board (method `auto`), clear the view, save the log to a file. Turn on **Timestamps** to see the time of each line.
+- A port that nobody reads for 15 minutes closes (`serial_idle_timeout` in the agent config).
+- For a device that is attached to your PC, the monitor uses its local port.
+
+![Serial monitor](docs/serial.png)
+
+CLI: `setup-manager serial bench-1 1-1` (Ctrl-] exits). In a script:
+`setup-manager serial bench-1 1-1 --read-only --wait-for "boot OK" --timeout 30` exits with 0 when the text comes, and with 1 when the time is over.
+
+## Files and flashing
+
+Select **Flash firmware…** in the **⋮** menu of a device. Select the file and a profile, then click **Flash**.
+
+1. The app copies the file to the setup PC (`/var/lib/setup-agent/files/flash/<busid>/`).
+2. It pauses the serial monitor of the device, because flash tools need the port alone.
+3. It runs the profile script on the setup PC.
+4. It shows the tool output, and the serial output of the new firmware for some seconds.
+
+Built-in profiles: esptool, st-flash, OpenOCD, pyOCD, nrfjprog, J-Link Commander, picotool, avrdude, dfu-util,
+and "copy to a USB drive" (DAPLink, UF2). The app selects one from the USB IDs and the MCU result, and
+remembers the last options for each device. Edit the script and the variables, and **Save as profile…**.
+
+| Variable | Value |
+|---|---|
+| `SM_FILE`, `SM_FILE_EXT` | The firmware on the setup PC, and its extension (`bin`, `hex`, `elf`, `uf2`) |
+| `SM_TTY`, `SM_TTYS` | The serial port(s) of the device |
+| `SM_SERIAL`, `SM_VID`, `SM_PID`, `SM_BUSID` | The USB device (`SM_SERIAL` selects the probe in st-flash, pyOCD, J-Link, nrfjprog) |
+| Your variables | For example `SM_TARGET=target/stm32h7x.cfg`, `SM_OFFSET=0x10000` |
+
+The flash tools must be installed on the setup PC. The script runs as the shell user of the agent (`run_as`). Tools that use USB directly (st-flash, OpenOCD, pyOCD, J-Link, picotool) need their udev rules for that user. The packages of most tools install them.
+
+For a device that is attached to your PC, the script runs on your PC with your local file.
+
+![Flash](docs/flash.png)
+
+CLI:
+
+```bash
+setup-manager flash bench-1 1-2 build/zephyr/zephyr.hex                # the last profile of this device
+setup-manager flash bench-1 1-1 fw.bin --profile "st-flash (STM32, ST-LINK)" --monitor 5
+setup-manager flash bench-1 1-1 fw.elf --profile OpenOCD --env SM_TARGET=target/stm32h7x.cfg
+setup-manager upload bench-1 data.bin           # to the agent's files folder
+setup-manager download bench-1 /var/log/syslog .
+setup-manager files bench-1
+```
+
+## Who uses a device
+
+When a device is in use by another client, the row says who, for example
+`in use by alice@lab-pc (192.168.1.33)`. The Take over dialog shows the name too.
+
+- Each Setup Manager tells the agent its name when it attaches a device. The name is `user@hostname`, or the name in **Preferences**.
+- For other clients (for example a manual `usbip attach`), the agent finds the IP address from the TCP connections on port 3240, and the host name from DNS when possible.
+
+## Device names
+
+Select **Rename…** in the **⋮** menu to give a device a nickname, for example
+"Board A, STM32H7 rev2". The nickname replaces the title, and the real name
+moves to the second line. The agent stores it with the USB serial number
+(or the port when there is no serial number), so every manager in the lab sees
+the same names. Search finds devices by nickname too.
+
+CLI: `setup-manager rename bench-1 1-1 Board A`.
+
 ## 4. Connect AI agents (MCP)
 
 The MCP server uses the same config and the same logic as the app. Devices
@@ -292,9 +368,19 @@ Tools:
 | `run_command` / `run_command_many` | Shell commands on one or many setups |
 | `identify_mcu` | Reset the MCU, read its log and guess the MCU (with profiles and scripts) |
 | `identify_profiles` / `save_identify_profile` | List and save identify profiles |
+| `serial_ports` / `serial_open` / `serial_close` | Serial ports of a setup, open (records from now on) and close |
+| `serial_read` | New serial output since your last read (or from an offset) |
+| `serial_write` | Send text (CR LF added by default) |
+| `serial_wait_for` | Wait until the output matches a regular expression |
+| `serial_reset` | Reset the board through the open port |
+| `flash_firmware` / `flash_profiles_list` | Flash a file from this PC with a profile, and return the boot output |
+| `upload_file` / `download_file` / `list_files` | Copy files to and from a setup PC |
+| `set_device_name` | Give a device a nickname |
 | `agent_log` | Recent agent log lines |
 
-Example requests to an agent: *"Find the ST-Link on the lab setups, attach it,
+Example requests to an agent: *"Flash build/zephyr.hex to Board A, then check
+that it prints 'boot OK' within 10 seconds."* (the agent uses serial_open,
+flash_firmware, serial_wait_for), *"Find the ST-Link on the lab setups, attach it,
 flash build/fw.elf with openocd, then detach it."* or *"Identify the MCU on
 every USB serial device of bench-2."*
 
@@ -314,6 +400,9 @@ setup-manager identify bench-1 1-2       # reset, read the log, guess the MCU
 setup-manager identify bench-1 1-2 --profile "Zephyr shell" --log
 setup-manager identify bench-1 1-2 --reset none --script start.sh --after-script ask.sh
 setup-manager identify --list-profiles
+setup-manager serial bench-1 1-1                 # serial terminal (Ctrl-] exits)
+setup-manager flash bench-1 1-1 fw.hex           # flash with the last profile of the device
+setup-manager rename bench-1 1-1 Board A         # nickname
 setup-manager discover                   # find agents with UDP broadcast
 setup-manager add 192.168.1.21 --name bench-2 --token ...
 setup-manager daemon                     # keep-attached without the app

@@ -18,6 +18,12 @@ API (all routes except /api/ping need "Authorization: Bearer <token>"):
   POST /api/usb/reset   {busid}
   POST /api/usb/identify {busid, reset, baud, duration, script, after_script, tty, user}
                                      reset the MCU and capture its serial log
+  POST /api/usb/flash   {busid, file, script, timeout, monitor_seconds, baud}
+  POST /api/usb/claim   {busid, client}   POST /api/usb/release {busid}
+  POST /api/usb/nickname {busid, name}
+  POST /api/serial/open {busid | tty, baud}      GET /api/serial/read?busid|tty&since&wait&max
+  POST /api/serial/write {busid | tty, data | data_b64}   POST /api/serial/reset | close
+  PUT  /api/files?path=   (body = the file)      GET /api/files?path=   GET /api/files/list?path=
   POST /api/usbipd/start
   POST /api/exec        {command, timeout, cwd, user}
   GET  /api/shell?cols=&rows=&user=  WebSocket, interactive PTY shell
@@ -53,7 +59,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_CONFIG_PATH = "/etc/setup-agent/config.json"
 DISCOVERY_MAGIC = b"SETUP-MANAGER-DISCOVER"
 BUSID_RE = re.compile(r"^\d+-\d+(\.\d+)*$")
@@ -86,6 +92,13 @@ DEFAULTS = {
     "sysfs_root": "/sys",
     "devfs_root": "/dev",
     "exec_timeout_max": 3600,
+    # Uploaded files (firmware). Relative paths in the files API go here.
+    "files_dir": "/var/lib/setup-agent/files",
+    "max_upload": 1024 * 1024 * 1024,
+    # A serial port that nobody reads for this time is closed.
+    "serial_idle_timeout": 900,
+    # Device nicknames: rule ("vid:pid:serial" or busid) -> name.
+    "nicknames": {},
 }
 
 USB_CLASSES = {
@@ -383,6 +396,9 @@ class UsbManager:
             "net": nets,
         }
         dev["protected"] = any(match_rule(r, dev) for r in self.cfg.get("protected") or [])
+        nicks = self.cfg.get("nicknames") or {}
+        dev["nickname"] = nicks.get(device_rule(dev).lower()) or next(
+            (n for r, n in nicks.items() if match_rule(r, dev)), None)
         dev["auto_bind"] = any(match_rule(r, dev) for r in self.cfg.get("auto_bind") or [])
         return dev
 
@@ -875,7 +891,8 @@ def do_reset(method, cap, hw_reset=None):
 
 
 def identify_capture(dev, paths, baud="auto", duration=4.0, reset="auto", script="", after_script="",
-                     run_script=None, hw_reset=None, script_timeout=30, extra_env=None, max_attempts=4):
+                     run_script=None, hw_reset=None, script_timeout=30, extra_env=None, max_attempts=4,
+                     capture_factory=None):
     """Start capturing the serial port(s), run the start script, reset, run the after-reset script,
     capture for `duration` seconds. With baud="auto", try other baud rates while the text is garbage."""
     try:
@@ -898,7 +915,7 @@ def identify_capture(dev, paths, baud="auto", duration=4.0, reset="auto", script
         result["notes"].append("this device has no serial port: no log to capture")
     best = None
     for b in bauds:
-        cap = SerialCapture(paths, b).start()
+        cap = (capture_factory or SerialCapture)(paths, b).start()
         env = {"SM_TTY": paths[0] if paths else "", "SM_TTYS": " ".join(paths), "SM_BAUD": str(b),
                "SM_BUSID": dev.get("busid", ""), "SM_VID": dev.get("vid", ""), "SM_PID": dev.get("pid", ""),
                "SM_SERIAL": dev.get("serial") or "", "SM_RESET": method}
@@ -977,6 +994,379 @@ def run_probe(dev, action, timeout=30):
         return p.returncode, "%s (rc=%d)%s" % (" ".join(cmd), p.returncode, (": " + out[-500:]) if out else "")
     except (OSError, subprocess.TimeoutExpired) as e:
         return -1, "%s failed: %s" % (" ".join(cmd), e)
+
+
+# --------------------------------------------------------------------------- serial hub (live serial monitor)
+
+class SerialSession:
+    """One serial port kept open, with a ring buffer that has absolute byte offsets.
+
+    Many clients can read the same port: each one keeps its own offset. The
+    port is opened again when it disappears and comes back (re-enumeration).
+    pause() closes the port for tools that need it alone (flashing), and
+    resume() opens it again.
+    """
+
+    def __init__(self, path, baud=115200, max_bytes=2 * 1024 * 1024):
+        self.path = path
+        self.baud = int(baud)
+        self.max_bytes = max_bytes
+        self.buf = bytearray()
+        self.start = 0
+        self.fd = None
+        self.paused = False
+        self.closed = False
+        self.events = collections.deque(maxlen=200)
+        self.cond = threading.Condition()
+        self.opened_at = time.time()
+        self.last_used = time.time()
+        self.wlock = threading.Lock()
+        if not self._open():
+            raise ApiError(404, "cannot open %s" % path)
+        self.thread = threading.Thread(target=self._loop, name="serial-%s" % os.path.basename(path), daemon=True)
+        self.thread.start()
+
+    @property
+    def end(self):
+        return self.start + len(self.buf)
+
+    def _event(self, text):
+        self.events.append({"offset": self.end, "time": time.time(), "text": text})
+
+    def _open(self):
+        try:
+            fd = os.open(self.path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        except OSError as e:
+            self._event("cannot open: %s" % (e.strerror or e))
+            return False
+        try:
+            _set_serial(fd, self.baud)
+        except (OSError, termios.error) as e:
+            self._event("cannot set %d baud: %s" % (self.baud, e))
+        with self.cond:
+            self.fd = fd
+        return True
+
+    def _close_fd(self):
+        with self.cond:
+            fd, self.fd = self.fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _loop(self):
+        last_try = 0.0
+        while not self.closed:
+            fd = self.fd
+            if fd is None:
+                if not self.paused and time.time() - last_try > 0.3 and os.path.exists(self.path):
+                    last_try = time.time()
+                    if self._open():
+                        self._event("reconnected")
+                time.sleep(0.05)
+                continue
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.2)
+            except (OSError, ValueError):
+                ready = []
+                time.sleep(0.05)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            except OSError:
+                chunk = b""
+            if not chunk:
+                self._close_fd()
+                self._event("port disconnected")
+                continue
+            with self.cond:
+                self.buf.extend(chunk)
+                if len(self.buf) > self.max_bytes:
+                    drop = len(self.buf) - self.max_bytes
+                    del self.buf[:drop]
+                    self.start += drop
+                self.cond.notify_all()
+
+    def read(self, since=0, max_bytes=65536, wait=0.0):
+        """Data from offset `since` (0 = the oldest data that is still in the buffer)."""
+        self.last_used = time.time()
+        deadline = time.time() + max(0.0, min(30.0, float(wait or 0)))
+        with self.cond:
+            since = self.end if since is None or since < 0 else since
+            while since >= self.end and not self.closed:
+                left = deadline - time.time()
+                if left <= 0:
+                    break
+                self.cond.wait(left)
+            lost = since < self.start
+            s = max(since, self.start)
+            data = bytes(self.buf[s - self.start: s - self.start + max(1, int(max_bytes))])
+            events = [e for e in self.events if e["offset"] >= since]
+            return {"data": data, "offset": s + len(data), "start": self.start, "end": self.end, "lost": lost,
+                    "events": events, "connected": self.fd is not None, "paused": self.paused, "baud": self.baud}
+
+    def write(self, data):
+        self.last_used = time.time()
+        with self.wlock:
+            deadline = time.time() + 5
+            while data:
+                fd = self.fd
+                if fd is None:
+                    raise ApiError(409, "%s is not connected%s" % (self.path, " (paused)" if self.paused else ""))
+                try:
+                    n = os.write(fd, data)
+                    data = data[n:]
+                except BlockingIOError:
+                    if time.time() > deadline:
+                        raise ApiError(504, "write to %s timed out" % self.path)
+                    select.select([], [fd], [], 0.2)
+                except OSError as e:
+                    raise ApiError(500, "write to %s failed: %s" % (self.path, e))
+
+    def set_baud(self, baud):
+        baud = int(baud)
+        if baud == self.baud:
+            return
+        self.baud = baud
+        if self.fd is not None:
+            try:
+                _set_serial(self.fd, baud)
+            except (OSError, termios.error) as e:
+                raise ApiError(400, "cannot set %d baud: %s" % (baud, e))
+        self._event("baud rate %d" % baud)
+
+    def modem(self, line, on):
+        if self.fd is None:
+            return ["%s: not connected" % os.path.basename(self.path)]
+        try:
+            _modem(self.fd, line, on)
+            return []
+        except OSError as e:
+            return ["%s: %s" % (os.path.basename(self.path), e.strerror or e)]
+
+    def pause(self, why="paused"):
+        self.paused = True
+        self._close_fd()
+        self._event(why)
+
+    def resume(self):
+        if not self.paused:
+            return
+        self.paused = False
+        for _ in range(50):  # the port can need some time to come back after flashing
+            if os.path.exists(self.path) and self._open():
+                self._event("resumed")
+                return
+            time.sleep(0.1)
+        self._event("resumed, waiting for the port")
+
+    def close(self):
+        self.closed = True
+        with self.cond:
+            self.cond.notify_all()
+        # Stop the reader before the fd is closed: else a new session can get the same fd
+        # number while the old thread still reads it, and the old thread takes its data.
+        if threading.current_thread() is not self.thread:
+            self.thread.join(1.0)
+        self._close_fd()
+
+    def info(self):
+        return {"tty": os.path.basename(self.path), "path": self.path, "baud": self.baud, "end": self.end,
+                "start": self.start, "connected": self.fd is not None, "paused": self.paused,
+                "opened_at": self.opened_at, "last_used": self.last_used}
+
+
+class SerialHub:
+    def __init__(self, idle_timeout=900):
+        self.sessions = {}
+        self.lock = threading.Lock()
+        self.idle_timeout = idle_timeout
+        threading.Thread(target=self._reaper, name="serial-reaper", daemon=True).start()
+
+    def open(self, path, baud=None):
+        with self.lock:
+            s = self.sessions.get(path)
+            if s is None or s.closed:
+                s = SerialSession(path, baud or 115200)
+                self.sessions[path] = s
+                log.info("serial %s opened at %d baud", path, s.baud)
+            elif baud:
+                s.set_baud(baud)
+            s.last_used = time.time()
+            return s
+
+    def get(self, path):
+        s = self.sessions.get(path)
+        if s is None or s.closed:
+            raise ApiError(404, "%s is not open (open it first)" % os.path.basename(path))
+        return s
+
+    def close(self, path):
+        with self.lock:
+            s = self.sessions.pop(path, None)
+        if s:
+            s.close()
+            log.info("serial %s closed", path)
+        return {"closed": bool(s)}
+
+    def pause(self, paths, why):
+        paused = []
+        for p in paths:
+            s = self.sessions.get(p)
+            if s and not s.closed and not s.paused:
+                s.pause(why)
+                paused.append(s)
+        return paused
+
+    def list(self):
+        return [s.info() for s in self.sessions.values() if not s.closed]
+
+    def _reaper(self):
+        while True:
+            time.sleep(30)
+            for path, s in list(self.sessions.items()):
+                if time.time() - s.last_used > self.idle_timeout:
+                    log.info("serial %s idle, closing", path)
+                    self.close(path)
+
+
+class HubCapture:
+    """SerialCapture interface on top of the hub, so identify and the monitor share the port."""
+
+    def __init__(self, hub, paths, baud):
+        self.hub = hub
+        self.paths = list(paths)
+        self.sessions = {}
+        self.created = []
+        self.offsets = {}
+        self.data = dict((p, bytearray()) for p in self.paths)
+        self.events = dict((p, []) for p in self.paths)
+        for p in self.paths:
+            existed = p in hub.sessions and not hub.sessions[p].closed
+            try:
+                s = hub.open(p, baud)
+            except ApiError as e:
+                self.events[p].append(e.message)
+                continue
+            if not existed:
+                self.created.append(p)
+            self.sessions[p] = s
+            self.offsets[p] = s.end
+
+    def start(self):
+        return self
+
+    def modem(self, line, on):
+        errors = []
+        for s in self.sessions.values():
+            errors += s.modem(line, on)
+        return errors
+
+    def write(self, data):
+        for s in self.sessions.values():
+            try:
+                s.write(data)
+            except ApiError:
+                pass
+
+    def close(self):
+        for p, s in self.sessions.items():
+            r = s.read(self.offsets[p], 256 * 1024, 0)
+            self.data[p] = bytearray(r["data"])
+            self.events[p] = [e["text"] for e in r["events"]]
+        for p in self.created:  # a port that the monitor did not use before: give it back
+            self.hub.close(p)
+
+    def all_bytes(self):
+        return b"".join(bytes(b) for b in self.data.values())
+
+
+# --------------------------------------------------------------------------- who uses a device (USB/IP clients)
+
+def _hex_ip(h):
+    if len(h) == 8:
+        return socket.inet_ntop(socket.AF_INET, struct.pack("<I", int(h, 16)))
+    raw = b"".join(struct.pack("<I", int(h[i:i + 8], 16)) for i in range(0, 32, 8))
+    ip = socket.inet_ntop(socket.AF_INET6, raw)
+    return ip[7:] if ip.startswith("::ffff:") else ip
+
+
+def parse_proc_net_tcp(text, port=3240):
+    """Remote IPs with an ESTABLISHED connection to the local `port` (from /proc/net/tcp or tcp6)."""
+    ips = set()
+    for line in text.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 4 or parts[3] != "01":
+            continue
+        try:
+            lport = int(parts[1].rsplit(":", 1)[1], 16)
+            if lport == port:
+                ips.add(_hex_ip(parts[2].rsplit(":", 1)[0]))
+        except (ValueError, IndexError, OSError):
+            continue
+    return ips
+
+
+def usbip_client_ips(port=3240):
+    ips = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        ips |= parse_proc_net_tcp(read_text(name) or "", port)
+    return ips
+
+
+_RDNS = {}
+
+
+def reverse_name(ip):
+    hit = _RDNS.get(ip)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    result = []
+
+    def lookup():
+        try:
+            result.append(socket.gethostbyaddr(ip)[0].split(".")[0])
+        except (OSError, UnicodeError):
+            pass
+    t = threading.Thread(target=lookup, daemon=True)
+    t.start()
+    t.join(0.5)  # do not block the request on a slow DNS server
+    name = result[0] if result else None
+    _RDNS[ip] = (time.time(), name)
+    return name
+
+
+# --------------------------------------------------------------------------- files (firmware upload)
+
+def safe_path(cfg, path, create_dirs=False):
+    """Relative paths go under files_dir and cannot leave it. Absolute paths are used as they are."""
+    base = os.path.abspath(cfg.get("files_dir") or "/var/lib/setup-agent/files")
+    if not path or not isinstance(path, str):
+        raise ApiError(400, "path is required")
+    if os.path.isabs(path):
+        full = os.path.abspath(path)
+    else:
+        full = os.path.abspath(os.path.join(base, path))
+        if full != base and not full.startswith(base + os.sep):
+            raise ApiError(400, "path leaves the files folder: %s" % path)
+    if create_dirs:
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+    return full
+
+
+def chown_to(user, path):
+    if not user or os.geteuid() != 0:
+        return
+    try:
+        pw = pwd.getpwnam(user)
+        os.chown(path, pw.pw_uid, pw.pw_gid)
+    except (KeyError, OSError):
+        pass
 
 
 class WebSocket:
@@ -1198,6 +1588,8 @@ class Agent:
         self.started = time.time()
         self.cfg_lock = threading.Lock()
         self.identify_locks = {}
+        self.hub = SerialHub(float(cfg.get("serial_idle_timeout") or 900))
+        self.claims = {}
 
     # -- API handlers ----------------------------------------------------------
     def ping(self):
@@ -1239,7 +1631,178 @@ class Agent:
 
     def usb_list(self, qs):
         include_hubs = qs.get("all", ["0"])[0] in ("1", "true", "yes")
-        return {"devices": self.usb.list(include_hubs=include_hubs), "usbip": self.usb.usbip_info()}
+        devices = self.usb.list(include_hubs=include_hubs)
+        self.annotate_users(devices)
+        return {"devices": devices, "usbip": self.usb.usbip_info()}
+
+    def annotate_users(self, devices):
+        """Add "used_by" to the devices that a USB/IP client uses: from claims, else from TCP connections."""
+        in_use = [d for d in devices if d["state"] == "in_use"]
+        for busid in [b for b, c in self.claims.items()
+                      if not any(d["busid"] == b for d in in_use) and time.time() - c["at"] > 15]:
+            self.claims.pop(busid, None)  # detached: forget the claim (after a grace time for a slow attach)
+        if not in_use:
+            return
+        ips = usbip_client_ips()
+        claimed_ips = {c["ip"] for c in self.claims.values()}
+        others = sorted(ips - claimed_ips)
+        for d in in_use:
+            c = self.claims.get(d["busid"])
+            if c:
+                d["used_by"] = dict(c, source="claim", connected=c["ip"] in ips if ips else None)
+            elif len(others) == 1:
+                d["used_by"] = {"ip": others[0], "host": reverse_name(others[0]), "source": "tcp"}
+            elif others:
+                d["used_by"] = {"ips": others, "source": "tcp"}
+
+    def claim(self, body, ip):
+        busid = body.get("busid")
+        self.usb.get(busid)
+        self.claims[busid] = {"client": str(body.get("client") or ip)[:80], "ip": ip, "at": time.time()}
+        return {"claimed": busid}
+
+    def release(self, body):
+        return {"released": bool(self.claims.pop(body.get("busid"), None))}
+
+    def set_nickname(self, body):
+        dev = self.usb.get(body.get("busid"))
+        name = str(body.get("name") or "").strip()[:60]
+        nicks = dict(self.cfg.get("nicknames") or {})
+        for r in [r for r in nicks if match_rule(r, dev)]:
+            nicks.pop(r)
+        if name:
+            nicks[device_rule(dev).lower()] = name
+        self.update_config({"nicknames": nicks})
+        return {"device": self.usb.get(dev["busid"])}
+
+    # -- serial monitor ----------------------------------------------------------
+    def serial_path(self, body):
+        """The device path from {tty} or {busid[, tty]}. The device must not be shared over USB/IP."""
+        tty = os.path.basename(str(body.get("tty") or ""))
+        if body.get("busid"):
+            dev = self.usb.get(body["busid"])
+            if dev["bound"]:
+                raise ApiError(409, "%s is shared over USB/IP: its serial port is on the client PC" % dev["busid"])
+            if not dev["ttys"]:
+                raise ApiError(404, "%s has no serial port" % dev["busid"])
+            if tty and tty not in dev["ttys"]:
+                raise ApiError(404, "%s has no port %s (ports: %s)" % (dev["busid"], tty, ", ".join(dev["ttys"])))
+            tty = tty or dev["ttys"][0]
+        if not re.match(r"^tty[A-Za-z]+[0-9]+$", tty or ""):
+            raise ApiError(400, "invalid serial port %r" % tty)
+        return os.path.join(self.cfg["devfs_root"], tty)
+
+    def serial_open(self, body):
+        s = self.hub.open(self.serial_path(body), body.get("baud"))
+        return s.info()
+
+    def serial_read(self, qs):
+        q = dict((k, v[0]) for k, v in qs.items())
+        s = self.hub.get(self.serial_path(q))
+        r = s.read(int(q.get("since", 0)), int(q.get("max", 65536)), float(q.get("wait", 0)))
+        r["data"] = base64.b64encode(r["data"]).decode()
+        return r
+
+    def serial_write(self, body):
+        s = self.hub.get(self.serial_path(body))
+        data = base64.b64decode(body["data_b64"]) if body.get("data_b64") else str(body.get("data", "")).encode()
+        s.write(data)
+        return {"written": len(data)}
+
+    def serial_reset(self, body):
+        path = self.serial_path(body)
+        s = self.hub.get(path)
+        dev = None
+        if body.get("busid"):
+            dev = self.usb.get(body["busid"])
+        method = body.get("method") or "auto"
+        if method == "auto":
+            method = auto_reset_method(dev or {})
+        cap = HubCapture(self.hub, [path], s.baud)
+
+        def hw_reset(m):
+            if dev is None:
+                return "%s reset needs the busid" % m
+            if m == "usb":
+                return self.usb.reset(dev["busid"])["message"]
+            return run_probe(dev, "reset")[1]
+        notes = do_reset(method, cap, hw_reset)
+        return {"method": method, "notes": notes}
+
+    # -- files and flashing --------------------------------------------------------
+    def files_list(self, qs):
+        path = safe_path(self.cfg, (qs.get("path") or [""])[0] or ".")
+        if not os.path.isdir(path):
+            raise ApiError(404, "no folder %s" % path)
+        out = []
+        for name in sorted(os.listdir(path)):
+            st = os.stat(os.path.join(path, name))
+            out.append({"name": name, "size": st.st_size, "mtime": st.st_mtime,
+                        "dir": os.path.isdir(os.path.join(path, name))})
+        return {"path": path, "files": out}
+
+    def files_delete(self, body):
+        path = safe_path(self.cfg, body.get("path"))
+        if os.path.isdir(path):
+            raise ApiError(400, "%s is a folder" % path)
+        os.remove(path)
+        return {"deleted": path}
+
+    def flash(self, body):
+        """Run a flash script for a device: $SM_FILE is the firmware, $SM_TTY the serial port."""
+        dev = self.usb.get(body.get("busid"))
+        if dev["bound"]:
+            raise ApiError(409, "%s is shared over USB/IP: stop sharing it first" % dev["busid"])
+        script = body.get("script") or ""
+        if not script.strip():
+            raise ApiError(400, "script is required")
+        fw = safe_path(self.cfg, body["file"]) if body.get("file") else ""
+        if fw and not os.path.isfile(fw):
+            raise ApiError(404, "no file %s on this PC" % fw)
+        paths = [os.path.join(self.cfg["devfs_root"], t) for t in dev["ttys"]]
+        env = {"SM_FILE": fw, "SM_FILE_EXT": os.path.splitext(fw)[1].lstrip(".").lower(),
+               "SM_TTY": paths[0] if paths else "", "SM_TTYS": " ".join(paths), "SM_BUSID": dev["busid"],
+               "SM_VID": dev["vid"], "SM_PID": dev["pid"], "SM_SERIAL": dev.get("serial") or "",
+               "SM_SETUP": self.cfg["name"], "SM_PHASE": "flash"}
+        env.update(dict((str(k), str(v)) for k, v in (body.get("env") or {}).items()))
+        lock = self.identify_locks.setdefault(dev["busid"], threading.Lock())
+        if not lock.acquire(False):
+            raise ApiError(409, "%s is busy (identify or flash running)" % dev["busid"])
+        paused = self.hub.pause(paths, "paused for flashing")
+        starts = dict((ps.path, ps.end) for ps in paused)  # the monitor shows what comes after the flash
+        try:
+            result = run_command(self.cfg, script, float(body.get("timeout") or 300), None, body.get("user"),
+                                 extra_env=env)
+        finally:
+            for s in paused:
+                s.resume()
+            lock.release()
+        log.info("flash %s with %s: rc=%s", dev["busid"], os.path.basename(fw) or "-", result["exit_code"])
+        result["env"] = env
+        monitor = float(body.get("monitor_seconds") or 0)
+        if monitor > 0:
+            result["monitor"] = self._monitor_after(dev["busid"], body.get("tty"), body.get("baud"), monitor, starts)
+        return result
+
+    def _monitor_after(self, busid, tty, baud, seconds, starts=None):
+        """After flashing: open the serial port (it can take time to come back) and read for some seconds."""
+        deadline = time.time() + min(120.0, seconds) + 5
+        last = None
+        while time.time() < deadline:
+            try:
+                path = self.serial_path({"busid": busid, "tty": tty})
+                s = self.hub.open(path, baud)
+                start = (starts or {}).get(path, s.end)  # only what the new firmware prints
+                time.sleep(min(120.0, seconds))
+                r = s.read(start, 256 * 1024, 0)
+                return {"tty": os.path.basename(path), "baud": s.baud, "offset": r["offset"],
+                        "text": r["data"].decode("utf-8", "replace")}
+            except ApiError as e:
+                last = e.message
+                time.sleep(0.3)
+        return {"error": last or "no serial port after flashing"}
+
+
 
     def identify(self, body):
         """Reset the MCU behind a USB device and capture its serial log (see identify_capture)."""
@@ -1273,7 +1836,8 @@ class Agent:
             result = identify_capture(dev, paths, body.get("baud", "auto"), body.get("duration", 4),
                                       body.get("reset", "auto"), body.get("script") or "",
                                       body.get("after_script") or "", run_script, hw_reset,
-                                      float(body.get("script_timeout") or 30))
+                                      float(body.get("script_timeout") or 30),
+                                      capture_factory=lambda ps, b: HubCapture(self.hub, ps, b))
             rc, info = run_probe(dev, "info")
             result["probe"] = info
         finally:
@@ -1289,7 +1853,7 @@ class Agent:
         return cfg
 
     def update_config(self, body):
-        allowed = {"name": str, "auto_bind": list, "protected": list}
+        allowed = {"name": str, "auto_bind": list, "protected": list, "nicknames": dict}
         changes = {}
         for key, typ in allowed.items():
             if key in body:
@@ -1297,6 +1861,9 @@ class Agent:
                     raise ApiError(400, "%s must be a %s" % (key, typ.__name__))
                 if typ is list:
                     changes[key] = [str(x).strip() for x in body[key] if str(x).strip()]
+                elif typ is dict:
+                    changes[key] = dict((str(k).strip().lower(), str(v).strip()[:60])
+                                        for k, v in body[key].items() if str(v).strip())
                 else:
                     changes[key] = body[key].strip() or socket.gethostname()
         with self.cfg_lock:
@@ -1414,16 +1981,64 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._dispatch("POST")
 
+    def do_PUT(self):
+        self._dispatch("PUT")
+
+    def _upload(self, qs):
+        """PUT /api/files?path=...: stream the request body to a file."""
+        cfg = self.agent.cfg
+        path = safe_path(cfg, (qs.get("path") or [""])[0], create_dirs=True)
+        ln = int(self.headers.get("Content-Length") or -1)
+        if ln < 0:
+            raise ApiError(411, "Content-Length is required")
+        if ln > int(cfg.get("max_upload") or 0):
+            raise ApiError(413, "file too large (max_upload is %d bytes)" % cfg.get("max_upload"))
+        tmp = path + ".part"
+        digest = hashlib.sha256()
+        left = ln
+        with open(tmp, "wb") as f:
+            while left > 0:
+                chunk = self.rfile.read(min(1024 * 1024, left))
+                if not chunk:
+                    raise ApiError(400, "upload cut off")
+                f.write(chunk)
+                digest.update(chunk)
+                left -= len(chunk)
+        os.replace(tmp, path)
+        os.chmod(path, 0o644)
+        chown_to(cfg.get("run_as"), path)
+        log.info("upload %s (%d bytes)", path, ln)
+        return {"path": path, "size": ln, "sha256": digest.hexdigest()}
+
+    def _download(self, qs):
+        path = safe_path(self.agent.cfg, (qs.get("path") or [""])[0])
+        if not os.path.isfile(path):
+            raise ApiError(404, "no file %s" % path)
+        size = os.path.getsize(path)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        with open(path, "rb") as f:
+            shutil.copyfileobj(f, self.wfile, 1024 * 1024)
+
     def _dispatch(self, method):
         url = urlparse(self.path)
         path = url.path.rstrip("/") or "/"
         qs = parse_qs(url.query)
         try:
-            body = self._body() if method == "POST" else {}
             if path == "/api/ping":
+                if method == "POST":
+                    self._body()
                 return self._send_json(200, self.agent.ping())
             if not self._authorized(qs):
+                self.close_connection = True  # do not read a body we will not use
                 return self._send_json(401, {"error": "unauthorized"})
+            if path == "/api/files" and method == "PUT":
+                return self._send_json(200, self._upload(qs))
+            if path == "/api/files" and method == "GET":
+                return self._download(qs)
+            body = self._body() if method == "POST" else {}
             if path == "/api/shell" and method == "GET":
                 return self._shell(qs)
             a = self.agent
@@ -1434,6 +2049,18 @@ class Handler(BaseHTTPRequestHandler):
                 ("POST", "/api/usb/unbind"): lambda: a.usb.unbind(body.get("busid")),
                 ("POST", "/api/usb/reset"): lambda: a.usb.reset(body.get("busid")),
                 ("POST", "/api/usb/identify"): lambda: a.identify(body),
+                ("POST", "/api/usb/flash"): lambda: a.flash(body),
+                ("POST", "/api/usb/claim"): lambda: a.claim(body, self.client_address[0]),
+                ("POST", "/api/usb/release"): lambda: a.release(body),
+                ("POST", "/api/usb/nickname"): lambda: a.set_nickname(body),
+                ("GET", "/api/serial"): lambda: {"sessions": a.hub.list()},
+                ("POST", "/api/serial/open"): lambda: a.serial_open(body),
+                ("GET", "/api/serial/read"): lambda: a.serial_read(qs),
+                ("POST", "/api/serial/write"): lambda: a.serial_write(body),
+                ("POST", "/api/serial/reset"): lambda: a.serial_reset(body),
+                ("POST", "/api/serial/close"): lambda: a.hub.close(a.serial_path(body)),
+                ("GET", "/api/files/list"): lambda: a.files_list(qs),
+                ("POST", "/api/files/delete"): lambda: a.files_delete(body),
                 ("GET", "/api/identify/methods"): lambda: {"reset": RESET_METHODS, "bauds": AUTO_BAUDS},
                 ("POST", "/api/usbipd/start"): lambda: {"notes": a.usb.ensure_usbipd(), **a.usb.usbip_info()},
                 ("POST", "/api/exec"): lambda: run_command(a.cfg, body.get("command"), body.get("timeout", 60),

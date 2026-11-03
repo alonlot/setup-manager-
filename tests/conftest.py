@@ -198,6 +198,8 @@ class FakeMcu:
                     self._say(self.replies[cmd])
 
     def close(self):
+        if self.stop:
+            return
         self.stop = True
         self.thread.join(1)
         os.close(self.master)

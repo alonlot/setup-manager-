@@ -145,6 +145,81 @@ def cmd_identify(args: argparse.Namespace) -> None:
         print(cap.get("log", "").rstrip() or "(nothing received)")
 
 
+def cmd_serial(args: argparse.Namespace) -> None:
+    from .serial_client import run_serial
+    logging.getLogger().setLevel(logging.WARNING)
+    sys.exit(run_serial(STORE, args))
+
+
+def cmd_upload(args: argparse.Namespace) -> None:
+    r = _run(lambda f: f.upload(args.setup, args.file, args.remote))
+    print(json.dumps(r, indent=2) if args.json else f"{r['path']}  {r['size']} bytes  sha256 {r['sha256'][:16]}…")
+
+
+def cmd_download(args: argparse.Namespace) -> None:
+    r = _run(lambda f: f.download(args.setup, args.remote, args.local))
+    print(json.dumps(r, indent=2) if args.json else f"{r['path']}  {r['size']} bytes")
+
+
+def cmd_files(args: argparse.Namespace) -> None:
+    r = _run(lambda f: f.files(args.setup, args.path))
+    if args.json:
+        return _print(r, True)
+    print(r["path"])
+    for x in r["files"]:
+        print(f"  {'d' if x['dir'] else '-'} {x['size']:>12}  {x['name']}")
+
+
+def cmd_flash(args: argparse.Namespace) -> None:
+    if args.list_profiles:
+        for name, p in Fleet(STORE).flash_profiles().items():
+            print(f"{name:<38} {'' if p['builtin'] else '(yours)'}")
+        return
+    if not (args.setup and args.busid and args.file):
+        print("error: flash needs SETUP BUSID FILE", file=sys.stderr)
+        sys.exit(2)
+    opts: dict[str, Any] = {"timeout": args.timeout}
+    if args.script:
+        opts["script"] = sys.stdin.read() if args.script == "-" else Path(args.script).read_text()
+    if args.env:
+        opts["env"] = dict(e.split("=", 1) for e in args.env)
+    if args.monitor is not None:
+        opts["monitor_seconds"] = args.monitor
+    profile = args.profile
+    if not profile and not args.script:
+        profile = None
+
+    async def go(f: Fleet) -> Any:
+        prof = profile
+        if not prof and "script" not in opts:
+            devs = await f.usb(args.setup, include_hubs=True)
+            d = next((x for x in devs if x["busid"] == args.busid), {"busid": args.busid})
+            last = f.flash_options(args.setup, d)
+            prof = last.get("profile") or None
+            for k in ("script", "env", "monitor_seconds"):
+                if k in last and k not in opts:
+                    opts[k] = last[k]
+            print(f"profile: {prof}", file=sys.stderr)
+        return await f.flash(args.setup, args.busid, args.file, prof, opts)
+    r = _run(go)
+    if args.json:
+        return _print(r, True)
+    sys.stdout.write(r.get("stdout") or "")
+    sys.stderr.write(r.get("stderr") or "")
+    print(f"\n=== flash {'OK' if r['ok'] else 'FAILED'} (exit {r.get('exit_code')}, {r.get('duration')}s, "
+          f"on {r['where']}) ===")
+    m = r.get("monitor")
+    if m:
+        print(f"--- serial after the flash ({m.get('tty')}) ---")
+        print(m.get("text") or m.get("error") or "(nothing)")
+    sys.exit(0 if r["ok"] else 1)
+
+
+def cmd_rename(args: argparse.Namespace) -> None:
+    r = _run(lambda f: f.set_nickname(args.setup, args.busid, " ".join(args.name)))
+    print(r["message"])
+
+
 def cmd_add(args: argparse.Namespace) -> None:
     fields = {"name": args.name or args.host, "host": args.host, "port": args.port, "token": args.token or "",
               "tls": args.tls}
@@ -339,6 +414,53 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--list-profiles", action="store_true")
     p.add_argument("--log", action="store_true", help="print the captured log")
     p.set_defaults(fn=cmd_identify)
+
+    p = sub.add_parser("serial", help="serial terminal of a device (Ctrl-] exits), or wait for a pattern")
+    p.add_argument("setup")
+    p.add_argument("busid", nargs="?")
+    p.add_argument("--tty", help="a port of the device (e.g. ttyUSB1), or a port name without busid")
+    p.add_argument("--baud", type=int, default=None, help="default 115200, or the rate the port has now")
+    p.add_argument("--eol", choices=["cr", "lf", "crlf"], default="cr", help="what Enter sends (default cr)")
+    p.add_argument("--history", action="store_true", help="first print what is already in the buffer")
+    p.add_argument("--read-only", action="store_true")
+    p.add_argument("--wait-for", metavar="REGEX", help="exit 0 when the output matches, 1 on timeout")
+    p.add_argument("--timeout", type=float, default=0, help="seconds (with --wait-for, or to stop reading)")
+    p.set_defaults(fn=cmd_serial)
+
+    p = sub.add_parser("upload", help="copy a file to a setup PC")
+    p.add_argument("setup")
+    p.add_argument("file")
+    p.add_argument("remote", nargs="?", help="path on the setup (relative = in the agent's files folder)")
+    p.set_defaults(fn=cmd_upload)
+
+    p = sub.add_parser("download", help="copy a file from a setup PC")
+    p.add_argument("setup")
+    p.add_argument("remote")
+    p.add_argument("local", nargs="?")
+    p.set_defaults(fn=cmd_download)
+
+    p = sub.add_parser("files", help="list a folder on a setup PC")
+    p.add_argument("setup")
+    p.add_argument("path", nargs="?", default=".")
+    p.set_defaults(fn=cmd_files)
+
+    p = sub.add_parser("flash", help="flash a firmware file to a board")
+    p.add_argument("setup", nargs="?")
+    p.add_argument("busid", nargs="?")
+    p.add_argument("file", nargs="?")
+    p.add_argument("--profile", help="flash profile (see --list-profiles). Default: the last one for the device")
+    p.add_argument("--script", help="bash script file instead of the profile script ('-' = stdin)")
+    p.add_argument("--env", action="append", metavar="NAME=VALUE", help="e.g. SM_TARGET=target/stm32h7x.cfg")
+    p.add_argument("--monitor", type=float, help="seconds of serial output to show after the flash")
+    p.add_argument("--timeout", type=float, default=300)
+    p.add_argument("--list-profiles", action="store_true")
+    p.set_defaults(fn=cmd_flash)
+
+    p = sub.add_parser("rename", help="give a device a nickname (no name = remove it)")
+    p.add_argument("setup")
+    p.add_argument("busid")
+    p.add_argument("name", nargs="*")
+    p.set_defaults(fn=cmd_rename)
 
     p = sub.add_parser("add", help="add a setup")
     p.add_argument("host")

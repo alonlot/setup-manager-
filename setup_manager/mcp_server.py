@@ -33,7 +33,10 @@ runs, as if it was plugged in locally (e.g. /dev/ttyACM0, an ST-Link, a J-Link).
 
 Typical flow: list_setups -> list_usb(setup) or find_usb("st-link") ->
 attach_usb(setup, busid) -> work with the device -> detach_usb(setup, busid).
-Use run_command to run shell commands on a setup PC (flash tools, logs, ...).
+Use run_command to run shell commands on a setup PC.
+To flash and check a board: serial_open (before the flash), flash_firmware(file=...),
+then serial_wait_for("your boot message"). serial_read gives the new output since your last read.
+Devices can have nicknames (set_device_name); "used_by_text" says who has a device.
 identify_mcu resets a board, reads its boot log and guesses the MCU. Devices that were
 identified before show it in the "mcu" field of list_usb.
 A setup can be given by id, name or host. A busid looks like "1-1.2".
@@ -43,6 +46,7 @@ A setup can be given by id, name or host. A busid looks like "1-1.2".
 class _State:
     fleet: Fleet | None = None
     lock: asyncio.Lock | None = None
+    cursors: dict[str, int] = {}
 
 
 async def _fleet() -> Fleet:
@@ -75,7 +79,7 @@ async def _call(fn: Any) -> Any:
 
 def _short_device(d: dict[str, Any]) -> dict[str, Any]:
     keys = ("busid", "name", "vidpid", "serial", "state", "state_detail", "attached_here", "local_port", "ttys",
-            "sticky", "auto_bind", "protected", "setup", "setup_name", "mcu")
+            "sticky", "auto_bind", "protected", "setup", "setup_name", "mcu", "nickname", "used_by_text")
     return {k: d[k] for k in keys if k in d}
 
 
@@ -189,6 +193,136 @@ def build_server(store: ConfigStore | None = None) -> Any:
                                            "after_script": after_script})
             return {"saved": name}
         return await _call(go)
+
+    # -- serial ----------------------------------------------------------------
+    def _key(setup: str, busid: str, tty: str) -> str:
+        return f"{setup}/{busid}/{tty}"
+
+    @mcp.tool()
+    async def serial_ports(setup: str) -> list[dict[str, Any]]:
+        """The serial ports of a setup that you can open (devices that are not shared, or attached here)."""
+        return await _call(lambda f: f.serial_ports(setup))
+
+    @mcp.tool()
+    async def serial_open(setup: str, busid: str = "", tty: str = "", baud: int = 115200) -> dict[str, Any]:
+        """Open (or reuse) the serial port of a device and start to record its output.
+
+        Give busid (the port of that device is used, or tty to select one of its ports), or only tty.
+        The port stays open and records until serial_close or 15 minutes without reads. Open it BEFORE
+        you flash or reset a board, so that you get the boot output.
+        """
+        async def go(f: Fleet) -> Any:
+            h = await f.serial_open(setup, busid or None, tty or None, baud)
+            _State.cursors[_key(setup, busid, tty)] = h.get("end", 0)
+            return h
+        return await _call(go)
+
+    @mcp.tool()
+    async def serial_read(setup: str, busid: str = "", tty: str = "", since: int = -2, wait: float = 0,
+                          max_bytes: int = 20000) -> dict[str, Any]:
+        """Read the recorded serial output as text.
+
+        since=-2 (default): only what is new since your last serial_read or serial_open.
+        since=0: everything still in the buffer (up to 2 MB). since=N: from byte offset N.
+        wait: seconds to wait for new data when there is none yet.
+        """
+        async def go(f: Fleet) -> Any:
+            k = _key(setup, busid, tty)
+            start = _State.cursors.get(k, 0) if since == -2 else since
+            r = await f.serial_read(setup, busid or None, tty or None, start, wait, max_bytes)
+            _State.cursors[k] = r["offset"]
+            return {"text": r["data"].decode("utf-8", "replace"), "offset": r["offset"], "lost": r["lost"],
+                    "connected": r["connected"], "events": [e["text"] for e in r.get("events", [])][-10:]}
+        return await _call(go)
+
+    @mcp.tool()
+    async def serial_write(setup: str, text: str, busid: str = "", tty: str = "", end: str = "\r\n") -> dict:
+        """Send text to the serial port. end is added after the text (default CR LF; use "" for none)."""
+        return await _call(lambda f: f.serial_write(setup, busid or None, tty or None, (text + end).encode()))
+
+    @mcp.tool()
+    async def serial_wait_for(setup: str, pattern: str, busid: str = "", tty: str = "", timeout: float = 30,
+                              since: int = -1) -> dict[str, Any]:
+        """Wait until the serial output matches a regular expression (for example "boot OK|panic").
+
+        since=-1: only output that comes after this call. since=N: also output from offset N
+        (use the offset from serial_open to include output since you opened the port).
+        Returns matched, match, groups and the text that was read.
+        """
+        return await _call(lambda f: f.serial_wait_for(setup, busid or None, tty or None, pattern, timeout, since))
+
+    @mcp.tool()
+    async def serial_reset(setup: str, busid: str, method: str = "auto", tty: str = "") -> dict[str, Any]:
+        """Reset the board through the open serial port (methods as in identify_mcu: auto, rts, dtr, ...)."""
+        return await _call(lambda f: f.serial_reset(setup, busid, tty or None, method))
+
+    @mcp.tool()
+    async def serial_close(setup: str, busid: str = "", tty: str = "") -> dict[str, Any]:
+        """Close a serial port that you opened."""
+        return await _call(lambda f: f.serial_close(setup, busid or None, tty or None))
+
+    # -- files and flash --------------------------------------------------------
+    @mcp.tool()
+    async def upload_file(setup: str, local_path: str, remote_path: str = "") -> dict[str, Any]:
+        """Copy a file from this PC to a setup PC. A relative remote_path goes in the agent's files folder."""
+        return await _call(lambda f: f.upload(setup, local_path, remote_path or None))
+
+    @mcp.tool()
+    async def download_file(setup: str, remote_path: str, local_path: str = "") -> dict[str, Any]:
+        """Copy a file from a setup PC to this PC (for example a log or a core dump)."""
+        return await _call(lambda f: f.download(setup, remote_path, local_path or None))
+
+    @mcp.tool()
+    async def list_files(setup: str, path: str = ".") -> dict[str, Any]:
+        """List a folder on a setup PC (relative paths are in the agent's files folder)."""
+        return await _call(lambda f: f.files(setup, path))
+
+    @mcp.tool()
+    async def flash_profiles_list() -> dict[str, Any]:
+        """The flash profiles (esptool, st-flash, OpenOCD, pyOCD, nrfjprog, J-Link, picotool, avrdude, ...)."""
+        async def go(f: Fleet) -> Any:
+            return f.flash_profiles()
+        return await _call(go)
+
+    @mcp.tool()
+    async def flash_firmware(setup: str, busid: str, file: str, profile: str = "", script: str = "",
+                             env: dict[str, str] | None = None, monitor_seconds: float = -1,
+                             timeout: float = 300) -> dict[str, Any]:
+        """Flash a firmware file (a path on this PC) to the board behind a USB device.
+
+        The file is copied to the setup PC and the profile script runs there ($SM_FILE = the file,
+        $SM_TTY = the serial port). profile: a name from flash_profiles_list; empty = the last one used
+        for this device, else a suggested one. script/env replace the profile values (for example
+        env={"SM_TARGET": "target/stm32h7x.cfg"}). monitor_seconds: read the serial output for this
+        time after the flash (-1 = the profile value). Check "ok", "stdout", "stderr" and "monitor".
+        """
+        async def go(f: Fleet) -> Any:
+            prof = profile or None
+            opts: dict[str, Any] = {"timeout": timeout}
+            if not prof and not script:
+                devs = await f.usb(setup, include_hubs=True)
+                d = next((x for x in devs if x["busid"] == busid), {"busid": busid})
+                last = f.flash_options(setup, d)
+                prof = last.get("profile") or None
+                opts.update({k: v for k, v in last.items() if k in ("script", "env", "monitor_seconds", "baud")})
+            if script:
+                opts["script"] = script
+            if env:
+                opts["env"] = env
+            if monitor_seconds >= 0:
+                opts["monitor_seconds"] = monitor_seconds
+            r = await f.flash(setup, busid, file, prof, opts)
+            for k in ("stdout", "stderr"):
+                r[k] = (r.get(k) or "")[-6000:]
+            r.pop("env", None)
+            return r
+        return await _call(go)
+
+    @mcp.tool()
+    async def set_device_name(setup: str, busid: str, name: str) -> dict[str, Any]:
+        """Give a USB device a nickname (for example "Board A, STM32H7 rev2"). Empty name removes it.
+        The name is stored on the setup PC, so every manager sees it."""
+        return await _call(lambda f: f.set_nickname(setup, busid, name))
 
     @mcp.tool()
     async def list_attached() -> list[dict[str, Any]]:

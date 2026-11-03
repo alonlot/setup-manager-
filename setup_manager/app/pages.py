@@ -188,6 +188,9 @@ class SetupPage(Page):
 
         self.stack.add_titled_with_icon(self._usb_tab(), "usb", "USB", "media-removable-symbolic")
         self.stack.add_titled_with_icon(self._terminal_tab(), "terminal", "Terminal", "utilities-terminal-symbolic")
+        from .serial import SerialMonitor
+        self.serial = SerialMonitor(win, sid)
+        self.stack.add_titled_with_icon(self.serial, "serial", "Serial", "network-transmit-receive-symbolic")
         run_box = _page_box()
         run_box.append(RunPanel(win, lambda: [self.sid]))
         self.stack.add_titled_with_icon(_scrolled(run_box), "run", "Run", "system-run-symbolic")
@@ -292,6 +295,12 @@ class SetupPage(Page):
         if self._timer is not None:
             GLib.source_remove(self._timer)
             self._timer = None
+        self.serial.set_visible_now(False)
+
+    def open_serial(self, busid: str) -> None:
+        """Show the Serial tab with the port of this device, and open it."""
+        self.stack.set_visible_child_name("serial")
+        self.serial.refresh_ports(select_busid=busid, then_open=True)
 
     def _tick(self) -> bool:
         name = self.stack.get_visible_child_name()
@@ -301,6 +310,10 @@ class SetupPage(Page):
 
     def _tab_changed(self) -> None:
         name = self.stack.get_visible_child_name()
+        self.serial.set_visible_now(name == "serial" and self.win.current is self)
+        if name == "serial":
+            self.serial.refresh_ports()
+            self.serial.term.grab_focus()
         if name == "usb":
             self.load_usb()
         elif name == "terminal":
