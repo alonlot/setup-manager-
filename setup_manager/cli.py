@@ -110,6 +110,41 @@ def cmd_simple(action: str) -> Any:
     return handler
 
 
+def cmd_identify(args: argparse.Namespace) -> None:
+    opts: dict[str, Any] = {"reset": args.reset, "baud": args.baud, "duration": args.duration, "tty": args.tty}
+    for key, path in (("script", args.script), ("after_script", args.after_script)):
+        if path:
+            opts[key] = sys.stdin.read() if path == "-" else Path(path).read_text()
+    if args.list_profiles:
+        profiles = Fleet(STORE).identify_profiles()
+        for name, p in profiles.items():
+            print(f"{name:<28} reset={p.get('reset')} baud={p.get('baud')}  {'' if p['builtin'] else '(yours)'}")
+        return
+    if not (args.setup and args.busid):
+        print("error: identify needs SETUP and BUSID", file=sys.stderr)
+        sys.exit(2)
+    r = _run(lambda f: f.identify(args.setup, args.busid, opts, args.profile))
+    if args.save_profile:
+        Fleet(STORE).save_identify_profile(args.save_profile, {k: v for k, v in opts.items() if v is not None})
+    if args.json:
+        return _print(r, True)
+    g, cap = r["guess"], r["capture"]
+    print(f"MCU: {g['label']}  ({round(100 * g['confidence'])}%{', sure' if g['sure'] else ''})")
+    if g.get("firmware"):
+        print("Firmware: " + ", ".join(g["firmware"]))
+    for e in g.get("evidence", [])[:5]:
+        print(f"  - {e}")
+    print(f"Reset: {cap.get('reset')}  Baud: {cap.get('baud')}  Ports: {', '.join(cap.get('ttys') or []) or 'none'}"
+          f"  Ran on: {r['where']}")
+    for n in cap.get("notes", []):
+        print(f"  note: {n}")
+    for s_ in cap.get("scripts", []):
+        print(f"  {s_.get('phase')} script: exit {s_.get('exit_code')}")
+    if args.log or not g.get("mcu"):
+        print("----- log -----")
+        print(cap.get("log", "").rstrip() or "(nothing received)")
+
+
 def cmd_add(args: argparse.Namespace) -> None:
     fields = {"name": args.name or args.host, "host": args.host, "port": args.port, "token": args.token or "",
               "tls": args.tls}
@@ -289,6 +324,21 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("command", nargs=argparse.REMAINDER)
     p.add_argument("--timeout", type=float, default=60)
     p.set_defaults(fn=cmd_exec)
+
+    p = sub.add_parser("identify", help="reset the MCU, read its boot log and guess which MCU it is")
+    p.add_argument("setup", nargs="?")
+    p.add_argument("busid", nargs="?")
+    p.add_argument("--profile", help="identify profile (see --list-profiles)")
+    p.add_argument("--reset", help="auto, rts, dtr, rts+dtr, repl, probe, usb or none")
+    p.add_argument("--baud", help="'auto' or a number, e.g. 115200")
+    p.add_argument("--duration", type=float, help="seconds to capture after the reset")
+    p.add_argument("--tty", help="only this port of the device, e.g. ttyUSB1")
+    p.add_argument("--script", help="bash script file to run at the start (before the reset), '-' = stdin")
+    p.add_argument("--after-script", help="bash script file to run after the reset")
+    p.add_argument("--save-profile", metavar="NAME", help="save these options as a profile")
+    p.add_argument("--list-profiles", action="store_true")
+    p.add_argument("--log", action="store_true", help="print the captured log")
+    p.set_defaults(fn=cmd_identify)
 
     p = sub.add_parser("add", help="add a setup")
     p.add_argument("host")

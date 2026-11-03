@@ -116,6 +116,11 @@ def device_row(win: "MainWindow", sid: str, d: dict[str, Any], show_setup: bool 
     st.set_size_request(118, -1)
     row.add_prefix(st)
 
+    from .identify import mcu_pill  # here, to avoid an import cycle
+    mp = mcu_pill(win, sid, d)
+    if mp is not None:
+        row.add_suffix(mp)
+
     for flag, cls, icon, tip in (("sticky", "sticky", "view-pin-symbolic", "Keep attached"),
                                  ("auto_bind", "auto", "emblem-synchronizing-symbolic", "Auto-share when plugged"),
                                  ("protected", "lock", "changes-prevent-symbolic", "Protected on the setup PC")):
@@ -173,6 +178,7 @@ def device_row(win: "MainWindow", sid: str, d: dict[str, Any], show_setup: bool 
     item("Keep attached here", "sticky", "view-pin-symbolic", bool(d.get("sticky")))
     item("Auto-share when plugged", "autobind", "emblem-synchronizing-symbolic", bool(d.get("auto_bind")))
     menu.append(Gtk.Separator())
+    item("Identify MCU…", "identify", "dialog-question-symbolic")
     item("USB reset (re-plug)", "reset", "view-refresh-symbolic")
     item("Copy bus ID", "copy-busid", "edit-copy-symbolic")
     item("Copy usbip attach command", "copy-attach", "edit-copy-symbolic")

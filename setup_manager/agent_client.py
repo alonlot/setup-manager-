@@ -77,6 +77,12 @@ class AgentClient:
     async def reset(self, busid: str) -> dict:
         return await self.request("POST", "/api/usb/reset", {"busid": busid}, timeout=30)
 
+    async def identify(self, busid: str, options: dict) -> dict:
+        body = dict(options, busid=busid)
+        attempts = 1 if str(options.get("baud", "auto")) != "auto" else 4
+        wait = attempts * (float(options.get("duration") or 4) + 2 * float(options.get("script_timeout") or 30)) + 30
+        return await self.request("POST", "/api/usb/identify", body, timeout=min(wait, 900))
+
     async def start_usbipd(self) -> dict:
         return await self.request("POST", "/api/usbipd/start", {}, timeout=30)
 

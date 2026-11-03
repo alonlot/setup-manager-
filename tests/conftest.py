@@ -96,7 +96,9 @@ def agent(tmp_path, sysfs, monkeypatch):
         "discovery_port": dport,
         "protected": ["2-1.3"],
         "auto_bind_interval": 1,
+        "devfs_root": str(tmp_path / "dev"),
     }
+    (tmp_path / "dev").mkdir(exist_ok=True)
     cfg_path = tmp_path / "agent.json"
     cfg_path.write_text(json.dumps(cfg))
     env = dict(os.environ, FAKE_SYSFS=str(sysfs))
@@ -111,7 +113,8 @@ def agent(tmp_path, sysfs, monkeypatch):
     else:
         proc.kill()
         raise RuntimeError(proc.stdout.read().decode())
-    yield {"port": port, "discovery_port": dport, "sysfs": sysfs, "config": cfg_path, "proc": proc}
+    yield {"port": port, "discovery_port": dport, "sysfs": sysfs, "config": cfg_path, "proc": proc,
+           "devfs": tmp_path / "dev"}
     proc.terminate()
     try:
         proc.wait(5)
@@ -133,3 +136,81 @@ def manager_config(tmp_path, agent, monkeypatch):
     path = tmp_path / "manager.json"
     path.write_text(json.dumps(cfg))
     return path
+
+
+class FakeMcu:
+    """A fake board behind a pseudo-terminal.
+
+    On "RESET\\n" it prints a boot log. `baud`: it prints readable text only when the
+    port is set to this rate (else garbage), like a real UART at the wrong rate.
+    `replies` maps a received command to an answer.
+    """
+
+    def __init__(self, devfs: Path, name: str, boot: str, baud: int | None = None, replies=None):
+        import pty
+        import threading
+        self.master, slave = pty.openpty()
+        self.slave_path = os.ttyname(slave)
+        os.close(slave)
+        self.link = devfs / name
+        if self.link.exists() or self.link.is_symlink():
+            self.link.unlink()
+        self.link.symlink_to(self.slave_path)
+        self.boot, self.baud, self.replies = boot, baud, replies or {}
+        self.received = b""
+        self.stop = False
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _speed(self):
+        import fcntl
+        import struct
+        buf = bytearray(44)
+        fcntl.ioctl(self.master, 0x802C542A, buf)  # TCGETS2
+        return struct.unpack("IIIIB19sII", bytes(buf))[7]
+
+    def _say(self, text: str):
+        if self.baud and self._speed() != self.baud:
+            os.write(self.master, bytes((i * 37 + 129) % 256 for i in range(len(text))))
+        else:
+            os.write(self.master, text.encode())
+
+    def _loop(self):
+        import select
+        while not self.stop:
+            r, _, _ = select.select([self.master], [], [], 0.1)
+            if not r:
+                continue
+            try:
+                self.received += os.read(self.master, 4096)
+            except OSError:  # EIO while no process has the slave side open
+                time.sleep(0.05)
+                continue
+            while b"\n" in self.received or b"\r" in self.received:
+                for sep in (b"\n", b"\r"):
+                    if sep in self.received:
+                        line, _, self.received = self.received.partition(sep)
+                        break
+                cmd = line.decode(errors="replace").strip()
+                if cmd == "RESET":
+                    self._say(self.boot)
+                elif cmd in self.replies:
+                    self._say(self.replies[cmd])
+
+    def close(self):
+        self.stop = True
+        self.thread.join(1)
+        os.close(self.master)
+
+
+@pytest.fixture
+def fake_mcus():
+    made = []
+
+    def make(*args, **kw):
+        m = FakeMcu(*args, **kw)
+        made.append(m)
+        return m
+    yield make
+    for m in made:
+        m.close()

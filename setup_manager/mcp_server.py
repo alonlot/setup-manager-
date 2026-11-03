@@ -34,6 +34,8 @@ runs, as if it was plugged in locally (e.g. /dev/ttyACM0, an ST-Link, a J-Link).
 Typical flow: list_setups -> list_usb(setup) or find_usb("st-link") ->
 attach_usb(setup, busid) -> work with the device -> detach_usb(setup, busid).
 Use run_command to run shell commands on a setup PC (flash tools, logs, ...).
+identify_mcu resets a board, reads its boot log and guesses the MCU. Devices that were
+identified before show it in the "mcu" field of list_usb.
 A setup can be given by id, name or host. A busid looks like "1-1.2".
 """
 
@@ -73,7 +75,7 @@ async def _call(fn: Any) -> Any:
 
 def _short_device(d: dict[str, Any]) -> dict[str, Any]:
     keys = ("busid", "name", "vidpid", "serial", "state", "state_detail", "attached_here", "local_port", "ttys",
-            "sticky", "auto_bind", "protected", "setup", "setup_name")
+            "sticky", "auto_bind", "protected", "setup", "setup_name", "mcu")
     return {k: d[k] for k in keys if k in d}
 
 
@@ -146,6 +148,47 @@ def build_server(store: ConfigStore | None = None) -> Any:
         (for example after a board resets or a debugger re-enumerates). Needs the desktop app or
         `setup-manager daemon` to run on this PC."""
         return await _call(lambda f: f.set_sticky(setup, busid, enabled))
+
+    @mcp.tool()
+    async def identify_mcu(setup: str, busid: str, profile: str = "", reset: str = "", baud: str = "",
+                           duration: float = 0, script: str = "", after_script: str = "") -> dict[str, Any]:
+        """Reset the MCU behind a USB device, capture its serial boot log and guess which MCU it is.
+
+        reset: auto, rts (ESP32/ESP8266), dtr (Arduino), rts+dtr, repl (MicroPython), probe (st-flash/pyocd),
+        usb, none. baud: "auto" (tries rates until the text is readable) or a number.
+        script runs before the reset and after_script runs after it (bash, on the PC with the serial port,
+        with $SM_TTY = the port). Use them to make the device print more (for example send a command).
+        Their output is also used for the guess. profile: a saved profile name (see identify_profiles).
+        The result has guess.label (for example "ESP32-S3" or "probably STM32 (family)"), guess.sure,
+        guess.confidence, guess.evidence, and the captured log.
+        """
+        opts: dict[str, Any] = {"reset": reset or None, "baud": baud or None, "duration": duration or None,
+                                "script": script or None, "after_script": after_script or None}
+
+        async def go(f: Fleet) -> Any:
+            r = await f.identify(setup, busid, opts, profile or None)
+            log_text = r["capture"].get("log", "")
+            r["capture"]["log"] = log_text[-6000:]
+            r["capture"].pop("captures", None)
+            return r
+        return await _call(go)
+
+    @mcp.tool()
+    async def identify_profiles() -> dict[str, Any]:
+        """The identify profiles (built-in and saved) with their reset method, baud rate and scripts."""
+        async def go(f: Fleet) -> Any:
+            return f.identify_profiles()
+        return await _call(go)
+
+    @mcp.tool()
+    async def save_identify_profile(name: str, reset: str = "auto", baud: str = "auto", duration: float = 4,
+                                    script: str = "", after_script: str = "") -> dict[str, Any]:
+        """Save an identify profile (reset method, baud rate, duration and the two scripts) for later use."""
+        async def go(f: Fleet) -> Any:
+            f.save_identify_profile(name, {"reset": reset, "baud": baud, "duration": duration, "script": script,
+                                           "after_script": after_script})
+            return {"saved": name}
+        return await _call(go)
 
     @mcp.tool()
     async def list_attached() -> list[dict[str, Any]]:

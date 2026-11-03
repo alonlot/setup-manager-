@@ -100,6 +100,11 @@ print("CONFIG_PORT=%d" % cfg["port"])
 print("CONFIG_TOKEN=" + cfg["token"])
 PY
 
+if [[ -n "$RUN_AS" ]] && getent group dialout >/dev/null; then
+  # Scripts of "Identify MCU" run as this user and must open the serial ports.
+  usermod -aG dialout "$RUN_AS" 2>/dev/null && echo ">> added $RUN_AS to the dialout group (serial ports)"
+fi
+
 echo ">> installing systemd units"
 install -m 644 "$HERE/setup-agent.service" /etc/systemd/system/setup-agent.service
 install -m 644 "$HERE/setup-usbipd.service" /etc/systemd/system/setup-usbipd.service

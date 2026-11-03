@@ -44,6 +44,9 @@ def test_app_smoke(manager_config):
             n += 1
             row = row.get_next_sibling()
         seen["usb_rows"] = n
+        from setup_manager.app.identify import IdentifyDialog
+        dlg = IdentifyDialog(win, "bench", page.devices[0])
+        seen["dialog"] = dlg.options()["reset"] == "auto" and "ESP32 / ESP8266" in dlg.profile_names
         page.stack.set_visible_child_name("terminal")
         GLib.timeout_add(500, step3)
         return False
@@ -59,4 +62,4 @@ def test_app_smoke(manager_config):
     app.run([])
     assert seen["overview"] and seen["rows"] == ["bench"]
     assert seen["setup_page"] and seen["devices"] == ["1-1", "1-2", "1-3", "2-1.3"]
-    assert seen["usb_rows"] == 4 and seen["tabs"] == 1
+    assert seen["usb_rows"] == 4 and seen["tabs"] == 1 and seen["dialog"]

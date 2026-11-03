@@ -26,6 +26,10 @@ DEFAULTS: dict[str, Any] = {
     "discovery_targets": ["255.255.255.255"],
     "setups": [],
     "sticky": [],
+    # MCU identification: your own profiles, the last options per device, the results per device.
+    "identify_profiles": {},
+    "identify_last": {},
+    "mcu_results": {},
     # Quick commands in the Run tab of the app.
     "snippets": ["uname -a", "lsusb", "ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null", "dmesg | tail -n 40",
                  "usbip list -l", "uptime", "df -h /"],

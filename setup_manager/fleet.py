@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import socket
+import subprocess
 import time
 from typing import Any
 
 import aiohttp
 
+from . import mcu_detect
 from .agent_client import AgentClient, AgentError
 from .config import ConfigError, ConfigStore
 from .usbip_local import LocalUsbip, UsbipError
@@ -33,6 +36,9 @@ def match_rule(rule: str, dev: dict[str, Any]) -> bool:
     if len(parts) >= 3:
         return ":".join(parts[2:]) in ("*", (dev.get("serial") or "").lower())
     return True
+
+
+IDENTIFY_KEYS = ("reset", "baud", "duration", "script", "after_script", "script_timeout", "tty", "user")
 
 
 class FleetError(Exception):
@@ -212,7 +218,9 @@ class Fleet:
         data, ports = await asyncio.gather(self.client(setup).usb(include_hubs), self.local_ports())
         sticky = {x["busid"] for x in self.store.sticky() if x.get("setup") == setup["id"]}
         devices = data.get("devices", [])
+        results = self.store.data().get("mcu_results") or {}
         for d in devices:
+            d["mcu"] = results.get(self.device_key(setup["id"], d))
             p = self._match_port(ports, setup["id"], d["busid"])
             d["attached_here"] = p is not None
             d["local_port"] = p["port"] if p else None
@@ -388,6 +396,145 @@ class Fleet:
             st = self.sticky_state.get(self._sticky_key(item["setup"], item["busid"]), {})
             out.append({**item, "ok": st.get("ok"), "error": st.get("error")})
         return out
+
+    # -- MCU identification ----------------------------------------------------
+    @staticmethod
+    def device_key(sid: str, d: dict[str, Any]) -> str:
+        """Results follow the device by serial number when it has one, else by its port (busid)."""
+        return f"{sid}/{d.get('vid')}:{d.get('pid')}/{d.get('serial') or d.get('busid')}"
+
+    def identify_profiles(self) -> dict[str, dict[str, Any]]:
+        profiles = {k: dict(v, builtin=True) for k, v in mcu_detect.BUILTIN_PROFILES.items()}
+        for k, v in (self.store.data().get("identify_profiles") or {}).items():
+            profiles[k] = dict(v, builtin=False)
+        return profiles
+
+    def save_identify_profile(self, name: str, options: dict[str, Any] | None) -> None:
+        """Save (or with options=None delete) one of your identify profiles."""
+        name = name.strip()
+        if not name:
+            raise FleetError("the profile needs a name")
+        if name in mcu_detect.BUILTIN_PROFILES:
+            raise FleetError(f"'{name}' is a built-in profile. Save it with another name.")
+        data = self.store.data()
+        profiles = data.setdefault("identify_profiles", {})
+        if options is None:
+            profiles.pop(name, None)
+        else:
+            profiles[name] = {k: options.get(k) for k in IDENTIFY_KEYS if k in options}
+        self.store.save()
+
+    def identify_options(self, ref: str, busid: str, d: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The options to show in the identify dialog: the last ones used for this device, else Auto."""
+        setup = self.setup(ref)
+        last = (self.store.data().get("identify_last") or {}).get(self.device_key(setup["id"], d or {"busid": busid}))
+        base = dict(mcu_detect.BUILTIN_PROFILES["Auto"], profile="Auto")
+        base.pop("help", None)
+        return dict(base, **(last or {}))
+
+    async def identify(self, ref: str, busid: str, options: dict[str, Any] | None = None,
+                       profile: str | None = None) -> dict[str, Any]:
+        """Reset the MCU, capture its serial log and guess which MCU it is.
+
+        A profile gives the default options. Options given here replace them.
+        The run happens on the setup PC, or on this PC when the device is attached here.
+        """
+        setup = self.setup(ref)
+        opts: dict[str, Any] = {}
+        if profile:
+            profiles = self.identify_profiles()
+            if profile not in profiles:
+                raise FleetError(f"unknown profile '{profile}' (known: {', '.join(profiles)})", 404)
+            opts.update({k: v for k, v in profiles[profile].items() if k in IDENTIFY_KEYS})
+        opts.update({k: v for k, v in (options or {}).items() if k in IDENTIFY_KEYS and v is not None})
+        devs = await self.usb(setup["id"], include_hubs=True)
+        dev = next((d for d in devs if d["busid"] == busid), None)
+        if dev is None:
+            raise FleetError(f"no USB device {busid} on {setup['name']}", 404)
+        if dev.get("attached_here"):
+            raw = await self._identify_local(setup, dev, opts)
+            where = "this PC"
+        elif dev["state"] == "in_use":
+            raise FleetError(f"{busid} is attached to another client. Identify it there, or take it over.", 409)
+        else:
+            was_bound = bool(dev["bound"])
+            if was_bound:
+                await self.unbind(setup["id"], busid)  # the serial port must be on the setup PC
+                await asyncio.sleep(1.0)
+            try:
+                raw = await self._agent_call(self.client(setup).identify(busid, opts))
+            finally:
+                if was_bound:
+                    try:
+                        await self.bind(setup["id"], busid)  # share it again, as it was
+                    except FleetError as e:
+                        log.warning("could not share %s again: %s", busid, e.message)
+            where = setup["name"]
+        script_out = "\n".join((s.get("stdout") or "") + (s.get("stderr") or "") for s in raw.get("scripts", []))
+        guess = mcu_detect.analyze(dev, raw.get("log", ""), "\n".join(x for x in (raw.get("probe"), script_out) if x))
+        stored = {k: guess[k] for k in ("mcu", "label", "confidence", "sure", "firmware")}
+        stored.update({"evidence": guess["evidence"][:6], "at": time.time(), "busid": busid,
+                       "reset": raw.get("reset"), "baud": raw.get("baud")})
+        data = self.store.data()
+        key = self.device_key(setup["id"], dev)
+        data.setdefault("mcu_results", {})[key] = stored
+        data.setdefault("identify_last", {})[key] = dict(opts, profile=profile or opts.get("profile") or "")
+        self.store.save()
+        log.info("identified %s:%s as %s (%.0f%%)", setup["id"], busid, guess["label"], 100 * guess["confidence"])
+        return {"setup": setup["id"], "busid": busid, "where": where, "guess": guess, "capture": raw,
+                "device": {k: dev.get(k) for k in ("busid", "name", "vidpid", "serial", "ttys")}}
+
+    async def _identify_local(self, setup: dict[str, Any], dev: dict[str, Any], opts: dict[str, Any]) -> dict:
+        """Identify a device that is attached to this PC: use its local serial port(s)."""
+        from .agent import setup_agent as sa  # the same capture code as the agent
+
+        ports = await self.local_ports()
+        port = self._match_port(ports, setup["id"], dev["busid"])
+        local_busid = port.get("local_busid") if port else None
+        if not local_busid:
+            raise FleetError("cannot find the local USB port of the attached device", 500)
+        usb = sa.UsbManager({"sysfs_root": "/sys", "protected": [], "auto_bind": [], "usbip_cmd": "usbip"})
+        try:
+            local = usb.get(local_busid)
+        except sa.ApiError as e:
+            raise FleetError(e.message, e.code) from None
+        paths = [f"/dev/{t}" for t in local["ttys"]]
+        if opts.get("tty"):
+            paths = [p for p in paths if os.path.basename(p) == os.path.basename(str(opts["tty"]))]
+
+        def run_script(script: str, env: dict[str, str], timeout: float) -> dict[str, Any]:
+            env = dict(os.environ, SM_SETUP=setup["name"], SM_WHERE="manager", **env)
+            try:
+                p = subprocess.run(["bash", "-c", script], capture_output=True, env=env, timeout=timeout,
+                                   stdin=subprocess.DEVNULL)
+                return {"exit_code": p.returncode, "stdout": p.stdout.decode(errors="replace"),
+                        "stderr": p.stderr.decode(errors="replace"), "timed_out": False}
+            except subprocess.TimeoutExpired as e:
+                return {"exit_code": None, "stdout": (e.stdout or b"").decode(errors="replace"),
+                        "stderr": "", "timed_out": True}
+
+        def hw_reset(method: str) -> str:
+            if method == "usb":
+                return "USB reset is not available for an attached device (detach it first)"
+            return sa.run_probe(dev, "reset")[1]
+
+        def go() -> dict[str, Any]:
+            r = sa.identify_capture(dev, paths, opts.get("baud", "auto"), opts.get("duration", 4),
+                                    opts.get("reset", "auto"), opts.get("script") or "",
+                                    opts.get("after_script") or "", run_script, hw_reset,
+                                    float(opts.get("script_timeout") or 30))
+            r["probe"] = sa.run_probe(dev, "info")[1]
+            return r
+
+        try:
+            return await asyncio.get_running_loop().run_in_executor(None, go)
+        except sa.ApiError as e:
+            raise FleetError(e.message, e.code) from None
+
+    def forget_mcu(self, ref: str, d: dict[str, Any]) -> None:
+        setup = self.setup(ref)
+        (self.store.data().get("mcu_results") or {}).pop(self.device_key(setup["id"], d), None)
+        self.store.save()
 
     # -- commands --------------------------------------------------------------
     async def exec(self, ref: str, command: str, timeout: float = 60, cwd: str | None = None,

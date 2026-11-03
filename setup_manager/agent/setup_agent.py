@@ -16,6 +16,8 @@ API (all routes except /api/ping need "Authorization: Bearer <token>"):
   POST /api/usb/bind    {busid, force}
   POST /api/usb/unbind  {busid}
   POST /api/usb/reset   {busid}
+  POST /api/usb/identify {busid, reset, baud, duration, script, after_script, tty, user}
+                                     reset the MCU and capture its serial log
   POST /api/usbipd/start
   POST /api/exec        {command, timeout, cwd, user}
   GET  /api/shell?cols=&rows=&user=  WebSocket, interactive PTY shell
@@ -595,7 +597,7 @@ def base_env(user):
     return env
 
 
-def run_command(cfg, command, timeout=60, cwd=None, user=None):
+def run_command(cfg, command, timeout=60, cwd=None, user=None, extra_env=None):
     if not isinstance(command, str) or not command.strip():
         raise ApiError(400, "command is required")
     try:
@@ -608,7 +610,8 @@ def run_command(cfg, command, timeout=60, cwd=None, user=None):
     start = time.time()
     try:
         p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             cwd=cwd or home, env=base_env(user), start_new_session=True)
+                             cwd=cwd or home, env=dict(base_env(user), **(extra_env or {})),
+                             start_new_session=True)
     except OSError as e:
         raise ApiError(500, "cannot start command: %s" % e)
     timed_out = False
@@ -633,6 +636,347 @@ def run_command(cfg, command, timeout=60, cwd=None, user=None):
         "truncated": truncated,
         "duration": round(time.time() - start, 3),
     }
+
+
+# --------------------------------------------------------------------------- MCU identification (serial capture)
+
+TCGETS2 = 0x802C542A
+TCSETS2 = 0x402C542B
+BOTHER = 0o010000
+CBAUD = 0o010017
+AUTO_BAUDS = [115200, 74880, 9600, 57600, 230400, 460800, 921600]
+RESET_METHODS = {
+    "auto": "Choose from the USB IDs",
+    "rts": "ESP32/ESP8266 style: pulse RTS (EN pin)",
+    "dtr": "Arduino style: pulse DTR",
+    "rts+dtr": "Both: pulse RTS, then DTR",
+    "repl": "MicroPython/CircuitPython soft reset (Ctrl-C, Ctrl-D)",
+    "probe": "Debug probe tool (st-flash or pyocd)",
+    "usb": "USB port reset of the device",
+    "none": "No reset (only the scripts)",
+}
+ST_LINK_PIDS = {"3744", "3748", "374a", "374b", "374d", "374e", "374f", "3752", "3753", "3754", "3757"}
+USB_BRIDGES = {("10c4", "ea60"), ("1a86", "55d4"), ("1a86", "7523"), ("1a86", "7522"), ("0403", "6001"),
+               ("0403", "6010"), ("0403", "6014"), ("0403", "6015"), ("067b", "2303")}
+
+
+def is_debug_probe(dev):
+    vid, pid, prod = dev.get("vid"), dev.get("pid"), (dev.get("product") or "").lower()
+    return ((vid == "0483" and pid in ST_LINK_PIDS) or vid in ("0d28", "1366") or (vid, pid) == ("2e8a", "000c")
+            or "cmsis-dap" in prod or "daplink" in prod)
+
+
+def auto_reset_method(dev):
+    vid, pid = dev.get("vid"), dev.get("pid")
+    if vid == "303a":
+        return "rts"
+    if (vid, pid) in USB_BRIDGES:
+        return "rts+dtr"
+    if vid in ("2341", "2a03"):
+        return "dtr"
+    if is_debug_probe(dev):
+        return "probe"
+    if (vid, pid) in (("2e8a", "0005"),) or vid == "239a":
+        return "repl"
+    return "none"
+
+
+def _set_serial(fd, baud):
+    iflag, oflag, cflag, lflag, ispeed, ospeed, cc = termios.tcgetattr(fd)
+    iflag &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP | termios.INLCR | termios.IGNCR
+               | termios.ICRNL | termios.IXON | termios.IXOFF | termios.IXANY)
+    oflag &= ~termios.OPOST
+    lflag &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
+    cflag &= ~(termios.CSIZE | termios.PARENB | termios.CSTOPB | getattr(termios, "CRTSCTS", 0))
+    cflag |= termios.CS8 | termios.CREAD | termios.CLOCAL
+    cc[termios.VMIN] = 0
+    cc[termios.VTIME] = 0
+    speed = getattr(termios, "B%d" % baud, None)
+    termios.tcsetattr(fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, speed or termios.B38400,
+                                             speed or termios.B38400, cc])
+    if speed is None:  # a non-standard rate (e.g. 74880 for the ESP8266 ROM): Linux termios2
+        buf = bytearray(44)
+        fcntl.ioctl(fd, TCGETS2, buf)
+        i, o, c, l_, line, ccs, _isp, _osp = struct.unpack("IIIIB19sII", bytes(buf))
+        c = (c & ~CBAUD & ~(CBAUD << 16)) | BOTHER | (BOTHER << 16)
+        fcntl.ioctl(fd, TCSETS2, struct.pack("IIIIB19sII", i, o, c, l_, line, ccs, baud, baud))
+
+
+def _modem(fd, line, on):
+    bit = termios.TIOCM_DTR if line == "dtr" else termios.TIOCM_RTS
+    fcntl.ioctl(fd, termios.TIOCMBIS if on else termios.TIOCMBIC, struct.pack("I", bit))
+
+
+def readable_ratio(data):
+    if not data:
+        return 0.0
+    ok = sum(1 for b in data if 32 <= b < 127 or b in (9, 10, 13, 27))
+    return round(ok / float(len(data)), 3)
+
+
+class SerialCapture:
+    """Read one or more serial ports in a thread. Reopens a port that disappears (re-enumeration)."""
+
+    def __init__(self, paths, baud, max_bytes=256 * 1024):
+        self.paths = list(paths)
+        self.baud = baud
+        self.max_bytes = max_bytes
+        self.data = dict((p, bytearray()) for p in self.paths)
+        self.events = dict((p, []) for p in self.paths)
+        self.fds = {}
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._loop, name="serial-capture", daemon=True)
+        self.t0 = time.time()
+        for p in self.paths:
+            self._open(p, first=True)
+
+    def _event(self, path, text):
+        self.events[path].append("%.2fs %s" % (time.time() - self.t0, text))
+
+    def _open(self, path, first=False):
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        except OSError as e:
+            if first:
+                self._event(path, "cannot open: %s" % e)
+            return False
+        try:
+            _set_serial(fd, self.baud)
+            termios.tcflush(fd, termios.TCIFLUSH)
+        except (OSError, termios.error) as e:
+            self._event(path, "cannot set %d baud: %s" % (self.baud, e))
+        with self.lock:
+            self.fds[path] = fd
+        if not first:
+            self._event(path, "reopened")
+        return True
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def _loop(self):
+        last_try = 0.0
+        while not self.stop_event.is_set():
+            with self.lock:
+                fds = dict(self.fds)
+            missing = [p for p in self.paths if p not in fds]
+            if missing and time.time() - last_try > 0.2:
+                last_try = time.time()
+                for p in missing:
+                    if os.path.exists(p):
+                        self._open(p)
+            if not fds:
+                time.sleep(0.05)
+                continue
+            try:
+                ready, _, _ = select.select(list(fds.values()), [], [], 0.1)
+            except (OSError, ValueError):
+                ready = []
+            for path, fd in fds.items():
+                if fd not in ready:
+                    continue
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    self._event(path, "port disconnected")
+                    self._close(path)
+                    continue
+                buf = self.data[path]
+                if len(buf) < self.max_bytes:
+                    buf.extend(chunk[: self.max_bytes - len(buf)])
+
+    def _close(self, path):
+        with self.lock:
+            fd = self.fds.pop(path, None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def modem(self, line, on):
+        errors = []
+        with self.lock:
+            fds = dict(self.fds)
+        for path, fd in fds.items():
+            try:
+                _modem(fd, line, on)
+            except OSError as e:
+                errors.append("%s: %s" % (os.path.basename(path), e.strerror or e))
+        return errors
+
+    def write(self, data):
+        with self.lock:
+            fds = dict(self.fds)
+        for fd in fds.values():
+            try:
+                os.write(fd, data)
+            except OSError:
+                pass
+
+    def close(self):
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(2)
+        for p in list(self.fds):
+            self._close(p)
+
+    def total(self):
+        return sum(len(b) for b in self.data.values())
+
+    def all_bytes(self):
+        return b"".join(bytes(b) for b in self.data.values())
+
+
+def do_reset(method, cap, hw_reset=None):
+    """Reset the MCU. Returns a list of notes."""
+    notes = []
+
+    def pulse(line, seconds=0.1):
+        errs = cap.modem(line, True)
+        time.sleep(seconds)
+        errs += cap.modem(line, False)
+        return errs
+
+    if method in ("rts", "dtr", "rts+dtr"):
+        errs = cap.modem("rts", False) + cap.modem("dtr", False)
+        time.sleep(0.05)
+        if method in ("rts", "rts+dtr"):
+            errs += pulse("rts")
+        if method == "rts+dtr":
+            time.sleep(0.3)
+        if method in ("dtr", "rts+dtr"):
+            errs += pulse("dtr")
+        if errs:
+            notes.append("modem lines not supported: %s" % "; ".join(sorted(set(errs))))
+        else:
+            notes.append("reset with %s" % method.upper())
+    elif method == "repl":
+        cap.write(b"\r\x03\x03")
+        time.sleep(0.2)
+        cap.write(b"\x04")
+        notes.append("sent Ctrl-C, Ctrl-C, Ctrl-D (soft reset)")
+    elif method in ("probe", "usb"):
+        if hw_reset is None:
+            notes.append("%s reset is not available here" % method)
+        else:
+            notes.append(hw_reset(method))
+    elif method == "none":
+        notes.append("no reset")
+    else:
+        raise ApiError(400, "unknown reset method %r (use one of: %s)" % (method, ", ".join(RESET_METHODS)))
+    return notes
+
+
+def identify_capture(dev, paths, baud="auto", duration=4.0, reset="auto", script="", after_script="",
+                     run_script=None, hw_reset=None, script_timeout=30, extra_env=None, max_attempts=4):
+    """Start capturing the serial port(s), run the start script, reset, run the after-reset script,
+    capture for `duration` seconds. With baud="auto", try other baud rates while the text is garbage."""
+    try:
+        duration = max(0.5, min(120.0, float(duration or 4)))
+    except (TypeError, ValueError):
+        raise ApiError(400, "duration must be a number")
+    method = auto_reset_method(dev) if (reset or "auto") == "auto" else reset
+    if method not in RESET_METHODS:
+        raise ApiError(400, "unknown reset method %r (use one of: %s)" % (method, ", ".join(RESET_METHODS)))
+    if str(baud or "auto") == "auto":
+        bauds = AUTO_BAUDS[:max_attempts] if paths else [115200]
+    else:
+        try:
+            bauds = [int(baud)]
+        except ValueError:
+            raise ApiError(400, "baud must be a number or 'auto'")
+    result = {"reset": method, "reset_requested": reset or "auto", "ttys": [os.path.basename(p) for p in paths],
+              "attempts": [], "scripts": [], "notes": []}
+    if not paths:
+        result["notes"].append("this device has no serial port: no log to capture")
+    best = None
+    for b in bauds:
+        cap = SerialCapture(paths, b).start()
+        env = {"SM_TTY": paths[0] if paths else "", "SM_TTYS": " ".join(paths), "SM_BAUD": str(b),
+               "SM_BUSID": dev.get("busid", ""), "SM_VID": dev.get("vid", ""), "SM_PID": dev.get("pid", ""),
+               "SM_SERIAL": dev.get("serial") or "", "SM_RESET": method}
+        env.update(extra_env or {})
+        notes = []
+        try:
+            if script and run_script:
+                r = run_script(script, dict(env, SM_PHASE="start"), script_timeout)
+                r["phase"] = "start"
+                result["scripts"].append(r)
+            notes += do_reset(method, cap, hw_reset)
+            after = {}
+            t = None
+            if after_script and run_script:
+                def run_after():
+                    after.update(run_script(after_script, dict(env, SM_PHASE="after_reset"), script_timeout))
+                t = threading.Thread(target=run_after, daemon=True)
+                t.start()
+            time.sleep(duration)
+            if t is not None:
+                t.join(script_timeout)
+                after["phase"] = "after_reset"
+                result["scripts"].append(after)
+            time.sleep(0.2)
+        finally:
+            cap.close()
+        data = cap.all_bytes()
+        attempt = {"baud": b, "bytes": len(data), "readable": readable_ratio(data), "notes": notes,
+                   "events": dict((os.path.basename(p), e) for p, e in cap.events.items() if e)}
+        result["attempts"].append(attempt)
+        score = attempt["readable"] * min(1.0, len(data) / 64.0)
+        if best is None or score > best[0]:
+            best = (score, attempt, cap)
+        if len(bauds) == 1 or len(data) < 16 or attempt["readable"] >= 0.9:
+            break
+    _, attempt, cap = best
+    result["baud"] = attempt["baud"]
+    result["notes"] += attempt["notes"]
+    result["captures"] = [{"tty": os.path.basename(p), "bytes": len(cap.data[p]),
+                           "text": bytes(cap.data[p]).decode("utf-8", "replace")} for p in paths]
+    parts = []
+    for c in result["captures"]:
+        if len(result["captures"]) > 1:
+            parts.append("===== /dev/%s =====" % c["tty"])
+        parts.append(c["text"])
+    result["log"] = "\n".join(parts)
+    return result
+
+
+def probe_command(dev, action):
+    """The command line to reset ('reset') or describe ('info') the target of a debug probe, or None."""
+    vid, pid, sn = dev.get("vid"), dev.get("pid"), dev.get("serial") or ""
+    st_link = vid == "0483" and pid in ST_LINK_PIDS
+    if action == "info":
+        if st_link and shutil.which("st-info"):
+            return ["st-info", "--probe"] + (["--serial", sn] if sn else [])
+        return None
+    if st_link and shutil.which("st-flash"):
+        return ["st-flash"] + (["--serial", sn] if sn else []) + ["reset"]
+    if is_debug_probe(dev) and vid != "1366" and shutil.which("pyocd"):
+        return ["pyocd", "reset"] + (["-u", sn] if sn else [])
+    return None
+
+
+def run_probe(dev, action, timeout=30):
+    cmd = probe_command(dev, action)
+    if cmd is None:
+        return None, ("no tool found for this probe (install stlink-tools or pyocd), or use a start script"
+                      if action == "reset" else "")
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+        out = p.stdout.decode(errors="replace").strip()
+        if p.returncode != 0 and action == "info" and "--serial" in cmd:
+            p = subprocess.run(cmd[:2], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+            out = p.stdout.decode(errors="replace").strip()
+        return p.returncode, "%s (rc=%d)%s" % (" ".join(cmd), p.returncode, (": " + out[-500:]) if out else "")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return -1, "%s failed: %s" % (" ".join(cmd), e)
 
 
 class WebSocket:
@@ -853,6 +1197,7 @@ class Agent:
         self.cpu = CpuSampler()
         self.started = time.time()
         self.cfg_lock = threading.Lock()
+        self.identify_locks = {}
 
     # -- API handlers ----------------------------------------------------------
     def ping(self):
@@ -895,6 +1240,48 @@ class Agent:
     def usb_list(self, qs):
         include_hubs = qs.get("all", ["0"])[0] in ("1", "true", "yes")
         return {"devices": self.usb.list(include_hubs=include_hubs), "usbip": self.usb.usbip_info()}
+
+    def identify(self, body):
+        """Reset the MCU behind a USB device and capture its serial log (see identify_capture)."""
+        busid = body.get("busid")
+        dev = self.usb.get(busid)
+        if dev["bound"]:
+            raise ApiError(409, "%s is shared over USB/IP, so its serial port is not on this PC. Stop sharing it, "
+                                "or identify it on the PC that attached it." % busid)
+        ttys = dev["ttys"]
+        if body.get("tty"):
+            ttys = [t for t in ttys if t == os.path.basename(str(body["tty"]))]
+            if not ttys:
+                raise ApiError(404, "%s has no port %s (ports: %s)" % (busid, body["tty"], ", ".join(dev["ttys"])))
+        paths = [os.path.join(self.cfg["devfs_root"], t) for t in ttys]
+        user = body.get("user") or None
+
+        def run_script(script, env, timeout):
+            env = dict(env, SM_SETUP=self.cfg["name"])
+            return run_command(self.cfg, script, timeout, None, user, extra_env=env)
+
+        def hw_reset(method):
+            if method == "usb":
+                return self.usb.reset(busid)["message"]
+            rc, detail = run_probe(dev, "reset")
+            return detail
+
+        lock = self.identify_locks.setdefault(busid, threading.Lock())
+        if not lock.acquire(False):
+            raise ApiError(409, "an identification of %s is already running" % busid)
+        try:
+            result = identify_capture(dev, paths, body.get("baud", "auto"), body.get("duration", 4),
+                                      body.get("reset", "auto"), body.get("script") or "",
+                                      body.get("after_script") or "", run_script, hw_reset,
+                                      float(body.get("script_timeout") or 30))
+            rc, info = run_probe(dev, "info")
+            result["probe"] = info
+        finally:
+            lock.release()
+        result["device"] = self.usb.get(busid) if os.path.isdir(os.path.join(self.usb.base, busid)) else dev
+        log.info("identify %s: reset=%s baud=%s, %d bytes", busid, result["reset"], result["baud"],
+                 sum(c["bytes"] for c in result["captures"]))
+        return result
 
     def public_config(self):
         cfg = dict(self.cfg)
@@ -1046,6 +1433,8 @@ class Handler(BaseHTTPRequestHandler):
                 ("POST", "/api/usb/bind"): lambda: a.usb.bind(body.get("busid"), bool(body.get("force"))),
                 ("POST", "/api/usb/unbind"): lambda: a.usb.unbind(body.get("busid")),
                 ("POST", "/api/usb/reset"): lambda: a.usb.reset(body.get("busid")),
+                ("POST", "/api/usb/identify"): lambda: a.identify(body),
+                ("GET", "/api/identify/methods"): lambda: {"reset": RESET_METHODS, "bauds": AUTO_BAUDS},
                 ("POST", "/api/usbipd/start"): lambda: {"notes": a.usb.ensure_usbipd(), **a.usb.usbip_info()},
                 ("POST", "/api/exec"): lambda: run_command(a.cfg, body.get("command"), body.get("timeout", 60),
                                                            body.get("cwd"), body.get("user")),

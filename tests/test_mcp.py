@@ -48,6 +48,10 @@ def test_mcp_tools(manager_config):
                 _payload(await session.call_tool("detach_usb", {"setup": "bench", "busid": "1-2"}))
                 r = _payload(await session.call_tool("run_command", {"setup": "bench", "command": "echo mcp"}))
                 assert r["stdout"] == "mcp\n"
+                assert "identify_mcu" in tools
+                r = _payload(await session.call_tool("identify_mcu", {"setup": "bench", "busid": "1-3",
+                                                                      "reset": "none", "duration": 0.5}))
+                assert r["capture"]["ttys"] == [] and "label" in r["guess"]
                 bad = await session.call_tool("list_usb", {"setup": "nope"})
                 assert _is_error(bad) and "unknown setup" in bad.content[0].text
     asyncio.run(go())

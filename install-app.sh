@@ -98,6 +98,11 @@ else
   echo "!! usbip not found. Attach will not work until you install it (Ubuntu: linux-tools-generic)."
 fi
 
+if getent group dialout >/dev/null && ! id -nG "$USER" | grep -qw dialout; then
+  echo ">> adding $USER to the dialout group (serial ports of attached devices; log out and in once)"
+  sudo usermod -aG dialout "$USER"
+fi
+
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "!! add $BIN to your PATH to use the setup-manager command";; esac
 echo
 echo "Done. Open 'Setup Manager' from the app menu, or run: setup-manager"

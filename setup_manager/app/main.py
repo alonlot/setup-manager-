@@ -296,6 +296,9 @@ class MainWindow(Adw.ApplicationWindow):
             self.run_action(key, f.set_sticky(sid, busid, False))
         elif action == "autobind":
             self.run_action(key, f.set_auto_bind(sid, busid, not d.get("auto_bind")))
+        elif action == "identify":
+            from .identify import IdentifyDialog
+            IdentifyDialog(self, sid, d).present(self)
         elif action == "copy-busid":
             copy_text(self, busid)
             self.toast("Bus ID copied")
@@ -303,6 +306,15 @@ class MainWindow(Adw.ApplicationWindow):
             s = self.store.get_setup(sid)
             copy_text(self, f"sudo usbip attach -r {s['host'] if s else sid} -b {busid}")
             self.toast("Command copied")
+
+    def after_identify(self, sid: str) -> None:
+        """Show the new MCU label next to the device."""
+        for page in self.pages.values():
+            if isinstance(page, SetupPage) and page.sid == sid:
+                page._last_usb = ""
+                page.load_usb()
+            elif isinstance(page, SearchPage) and page is self.current:
+                page.search()
 
     def detach_port(self, port: int) -> None:
         self.run_action(f"port/{port}", self.fleet.detach_port(port))
