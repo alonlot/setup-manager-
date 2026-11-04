@@ -37,6 +37,7 @@ API (all routes except /api/ping need "Authorization: Bearer <token>"):
 import argparse
 import base64
 import collections
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -55,6 +56,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -601,11 +603,14 @@ def shell_argv(cfg, user, command=None):
             pwd.getpwnam(user)
         except KeyError:
             raise ApiError(400, "unknown user %s" % user)
-        tool = "runuser" if shutil.which("runuser") else "su"
-        argv = [tool, "-l", user]
         if command is not None:
-            argv += ["-c", command]
-        return argv, user_home(user)
+            # Not a login shell (-l): that would drop the environment (SM_* of flash and identify)
+            # and the working directory that Popen sets.
+            if shutil.which("runuser"):
+                return ["runuser", "-u", user, "--", shell, "-c", command], user_home(user)
+            return ["su", "-p", "-s", shell, user, "-c", command], user_home(user)
+        tool = "runuser" if shutil.which("runuser") else "su"
+        return [tool, "-l", user], user_home(user)
     if command is not None:
         return [shell, "-lc", command], user_home(me)
     return [shell, "-l"], user_home(me)
@@ -624,13 +629,18 @@ def base_env(user):
     return env
 
 
+def num(value, name, kind=float):
+    """A request parameter as a number, or a 400 error that names it."""
+    try:
+        return kind(value)
+    except (TypeError, ValueError):
+        raise ApiError(400, "%s must be a number" % name)
+
+
 def run_command(cfg, command, timeout=60, cwd=None, user=None, extra_env=None):
     if not isinstance(command, str) or not command.strip():
         raise ApiError(400, "command is required")
-    try:
-        timeout = float(timeout or 60)
-    except (TypeError, ValueError):
-        raise ApiError(400, "timeout must be a number")
+    timeout = num(timeout or 60, "timeout")
     timeout = max(1.0, min(timeout, float(cfg.get("exec_timeout_max") or 3600)))
     user = user or cfg.get("run_as") or current_user()
     argv, home = shell_argv(cfg, user, command)
@@ -650,7 +660,15 @@ def run_command(cfg, command, timeout=60, cwd=None, user=None, extra_env=None):
             os.killpg(p.pid, signal.SIGKILL)
         except OSError:
             pass
-        out, err = p.communicate()
+        try:
+            out, err = p.communicate(timeout=2)
+        except subprocess.TimeoutExpired as e:
+            # A grandchild left the process group but still holds our pipes: do not wait for it.
+            out, err = e.stdout or b"", e.stderr or b""
+            p.stdout.close()
+            p.stderr.close()
+            p.kill()
+            p.wait()
     truncated = len(out) > MAX_OUTPUT or len(err) > MAX_OUTPUT
     log.info("exec as %s (rc=%s, %.1fs): %s", user, p.returncode, time.time() - start, command[:200])
     return {
@@ -1024,7 +1042,8 @@ class SerialSession:
         self.max_bytes = max_bytes
         self.buf = bytearray()
         self.start = 0
-        self.fd = None
+        self.fd = None  # owned by the reader thread: it is the only one that closes it while it runs
+        self.want_close = False  # ask the reader thread to close the fd (pause)
         self.paused = False
         self.closed = False
         self.events = collections.deque(maxlen=200)
@@ -1042,7 +1061,8 @@ class SerialSession:
         return self.start + len(self.buf)
 
     def _event(self, text):
-        self.events.append({"offset": self.end, "time": time.time(), "text": text})
+        with self.cond:  # read() iterates the events under this lock
+            self.events.append({"offset": self.end, "time": time.time(), "text": text})
 
     def _open(self):
         try:
@@ -1055,22 +1075,34 @@ class SerialSession:
         except (OSError, termios.error) as e:
             self._event("cannot set %d baud: %s" % (self.baud, e))
         with self.cond:
+            if self.fd is not None or self.paused:  # opened by someone else, or paused, meanwhile
+                os.close(fd)
+                return self.fd is not None
             self.fd = fd
         return True
 
     def _close_fd(self):
+        """Close the fd now. Only when the reader thread is not running (or did not answer)."""
         with self.cond:
-            fd, self.fd = self.fd, None
+            self._close_locked()
+
+    def _close_locked(self):
+        fd, self.fd = self.fd, None
+        self.want_close = False
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
+        self.cond.notify_all()
 
     def _loop(self):
         last_try = 0.0
         while not self.closed:
-            fd = self.fd
+            with self.cond:
+                if self.want_close:
+                    self._close_locked()
+                fd = self.fd
             if fd is None:
                 if not self.paused and time.time() - last_try > 0.3 and os.path.exists(self.path):
                     last_try = time.time()
@@ -1085,17 +1117,19 @@ class SerialSession:
                 time.sleep(0.05)
             if not ready:
                 continue
-            try:
-                chunk = os.read(fd, 65536)
-            except BlockingIOError:
-                continue
-            except OSError:
-                chunk = b""
-            if not chunk:
-                self._close_fd()
-                self._event("port disconnected")
-                continue
             with self.cond:
+                if self.want_close or self.fd != fd:  # closed meanwhile: the number can belong to another file now
+                    continue
+                try:
+                    chunk = os.read(fd, 65536)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    self._close_locked()
+                    self._event("port disconnected")
+                    continue
                 self.buf.extend(chunk)
                 if len(self.buf) > self.max_bytes:
                     drop = len(self.buf) - self.max_bytes
@@ -1109,6 +1143,9 @@ class SerialSession:
         deadline = time.time() + max(0.0, min(30.0, float(wait or 0)))
         with self.cond:
             since = self.end if since is None or since < 0 else since
+            reset = since > self.end  # from a session that was closed and opened again
+            if reset:
+                since = self.end
             while since >= self.end and not self.closed:
                 left = deadline - time.time()
                 if left <= 0:
@@ -1118,57 +1155,77 @@ class SerialSession:
             s = max(since, self.start)
             data = bytes(self.buf[s - self.start: s - self.start + max(1, int(max_bytes))])
             events = [e for e in self.events if e["offset"] >= since]
-            return {"data": data, "offset": s + len(data), "start": self.start, "end": self.end, "lost": lost,
-                    "events": events, "connected": self.fd is not None, "paused": self.paused, "baud": self.baud}
+            r = {"data": data, "offset": s + len(data), "start": self.start, "end": self.end, "lost": lost,
+                 "events": events, "connected": self.fd is not None, "paused": self.paused, "baud": self.baud}
+            if reset:
+                r["reset"] = True
+            return r
 
     def write(self, data):
         self.last_used = time.time()
         with self.wlock:
             deadline = time.time() + 5
             while data:
-                fd = self.fd
-                if fd is None:
-                    raise ApiError(409, "%s is not connected%s" % (self.path, " (paused)" if self.paused else ""))
+                with self.cond:  # the reader thread closes the fd only under this lock
+                    fd = self.fd
+                    if fd is None:
+                        raise ApiError(409, "%s is not connected%s" % (self.path,
+                                                                       " (paused)" if self.paused else ""))
+                    try:
+                        n = os.write(fd, data)
+                        data = data[n:]
+                        continue
+                    except BlockingIOError:
+                        if time.time() > deadline:
+                            raise ApiError(504, "write to %s timed out" % self.path)
+                    except OSError as e:
+                        raise ApiError(500, "write to %s failed: %s" % (self.path, e))
                 try:
-                    n = os.write(fd, data)
-                    data = data[n:]
-                except BlockingIOError:
-                    if time.time() > deadline:
-                        raise ApiError(504, "write to %s timed out" % self.path)
                     select.select([], [fd], [], 0.2)
-                except OSError as e:
-                    raise ApiError(500, "write to %s failed: %s" % (self.path, e))
+                except (OSError, ValueError):
+                    time.sleep(0.05)
 
     def set_baud(self, baud):
         baud = int(baud)
         if baud == self.baud:
             return
         self.baud = baud
-        if self.fd is not None:
-            try:
-                _set_serial(self.fd, baud)
-            except (OSError, termios.error) as e:
-                raise ApiError(400, "cannot set %d baud: %s" % (baud, e))
+        with self.cond:
+            if self.fd is not None:
+                try:
+                    _set_serial(self.fd, baud)
+                except (OSError, termios.error) as e:
+                    raise ApiError(400, "cannot set %d baud: %s" % (baud, e))
         self._event("baud rate %d" % baud)
 
     def modem(self, line, on):
-        if self.fd is None:
-            return ["%s: not connected" % os.path.basename(self.path)]
-        try:
-            _modem(self.fd, line, on)
-            return []
-        except OSError as e:
-            return ["%s: %s" % (os.path.basename(self.path), e.strerror or e)]
+        with self.cond:
+            if self.fd is None:
+                return ["%s: not connected" % os.path.basename(self.path)]
+            try:
+                _modem(self.fd, line, on)
+                return []
+            except OSError as e:
+                return ["%s: %s" % (os.path.basename(self.path), e.strerror or e)]
 
     def pause(self, why="paused"):
-        self.paused = True
-        self._close_fd()
+        """Close the port (for flashing). Returns when the reader thread has let go of it."""
+        with self.cond:
+            self.paused = True
+            self.want_close = True
+            self.cond.notify_all()
+            deadline = time.time() + 0.3
+            while self.fd is not None and self.thread.is_alive() and time.time() < deadline:
+                self.cond.wait(0.05)
+            self._close_locked()  # only needed when the reader thread did not answer
         self._event(why)
 
     def resume(self):
         if not self.paused:
             return
-        self.paused = False
+        with self.cond:
+            self.paused = False
+            self.want_close = False
         for _ in range(50):  # the port can need some time to come back after flashing
             if os.path.exists(self.path) and self._open():
                 self._event("resumed")
@@ -1254,18 +1311,22 @@ class HubCapture:
         self.paths = list(paths)
         self.sessions = {}
         self.created = []
+        self.restore = {}  # path -> the baud rate the monitor had before, for sessions that stay open
         self.offsets = {}
         self.data = dict((p, bytearray()) for p in self.paths)
         self.events = dict((p, []) for p in self.paths)
         for p in self.paths:
-            existed = p in hub.sessions and not hub.sessions[p].closed
+            existing = hub.sessions.get(p)
+            before = None if existing is None or existing.closed else existing.baud
             try:
                 s = hub.open(p, baud)
             except ApiError as e:
                 self.events[p].append(e.message)
                 continue
-            if not existed:
+            if before is None:
                 self.created.append(p)
+            else:
+                self.restore[p] = before
             self.sessions[p] = s
             self.offsets[p] = s.end
 
@@ -1292,6 +1353,11 @@ class HubCapture:
             self.events[p] = [e["text"] for e in r["events"]]
         for p in self.created:  # a port that the monitor did not use before: give it back
             self.hub.close(p)
+        for p, baud in self.restore.items():  # the monitor keeps its own baud rate
+            try:
+                self.sessions[p].set_baud(baud)
+            except ApiError:
+                pass
 
     def all_bytes(self):
         return b"".join(bytes(b) for b in self.data.values())
@@ -1506,8 +1572,12 @@ class TlsFront:
         while True:
             try:
                 conn, addr = self.sock.accept()
-            except OSError:
-                return
+            except OSError as e:
+                if self.sock.fileno() < 0:  # the listening socket was closed: shutting down
+                    return
+                log.warning("TLS accept failed: %s", e)  # EMFILE, ENOBUFS, ECONNABORTED, ...: try again
+                time.sleep(0.1)
+                continue
             threading.Thread(target=self._handle, args=(conn, addr), name="tls", daemon=True).start()
 
     def _handle(self, conn, addr):
@@ -1970,7 +2040,7 @@ class Agent:
         owner = str(body.get("owner") or "").strip()[:80]
         if not owner:
             raise ApiError(400, "owner is required")
-        ttl = max(5.0, min(24 * 3600.0, float(body.get("ttl") or 300)))
+        ttl = max(5.0, min(24 * 3600.0, num(body.get("ttl") or 300, "ttl")))
         key = self._res_key(dev)
         with self.res_lock:
             r = self._active(key)
@@ -2060,7 +2130,8 @@ class Agent:
     def serial_read(self, qs):
         q = dict((k, v[0]) for k, v in qs.items())
         s = self.hub.get(self.serial_path(q))
-        r = s.read(int(q.get("since", 0)), int(q.get("max", 65536)), float(q.get("wait", 0)))
+        r = s.read(num(q.get("since", 0), "since", int), num(q.get("max", 65536), "max", int),
+                   num(q.get("wait", 0), "wait"))
         r["data"] = base64.b64encode(r["data"]).decode()
         return r
 
@@ -2097,9 +2168,15 @@ class Agent:
             raise ApiError(404, "no folder %s" % path)
         out = []
         for name in sorted(os.listdir(path)):
-            st = os.stat(os.path.join(path, name))
-            out.append({"name": name, "size": st.st_size, "mtime": st.st_mtime,
-                        "dir": os.path.isdir(os.path.join(path, name))})
+            full = os.path.join(path, name)
+            try:
+                st = os.stat(full)
+            except OSError:  # a dangling symlink, or a file that disappeared
+                try:
+                    st = os.lstat(full)
+                except OSError:
+                    continue
+            out.append({"name": name, "size": st.st_size, "mtime": st.st_mtime, "dir": os.path.isdir(full)})
         return {"path": path, "files": out}
 
     def files_delete(self, body):
@@ -2132,15 +2209,15 @@ class Agent:
         paused = self.hub.pause(paths, "paused for flashing")
         starts = dict((ps.path, ps.end) for ps in paused)  # the monitor shows what comes after the flash
         try:
-            result = run_command(self.cfg, script, float(body.get("timeout") or 300), None, body.get("user"),
-                                 extra_env=env)
+            result = run_command(self.cfg, script, num(body.get("timeout") or 300, "timeout"), None,
+                                 body.get("user"), extra_env=env)
         finally:
             for s in paused:
                 s.resume()
             lock.release()
         log.info("flash %s with %s: rc=%s", dev["busid"], os.path.basename(fw) or "-", result["exit_code"])
         result["env"] = env
-        monitor = float(body.get("monitor_seconds") or 0)
+        monitor = num(body.get("monitor_seconds") or 0, "monitor_seconds")
         if monitor > 0:
             result["monitor"] = self._monitor_after(dev["busid"], body.get("tty"), body.get("baud"), monitor, starts)
         return result
@@ -2197,7 +2274,7 @@ class Agent:
             result = identify_capture(dev, paths, body.get("baud", "auto"), body.get("duration", 4),
                                       body.get("reset", "auto"), body.get("script") or "",
                                       body.get("after_script") or "", run_script, hw_reset,
-                                      float(body.get("script_timeout") or 30),
+                                      num(body.get("script_timeout") or 30, "script_timeout"),
                                       capture_factory=lambda ps, b: HubCapture(self.hub, ps, b))
             rc, info = run_probe(dev, "info")
             result["probe"] = info
@@ -2300,6 +2377,7 @@ LEASE_ROUTES = {("POST", "/api/usb/bind"), ("POST", "/api/usb/unbind"), ("POST",
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "setup-agent/" + VERSION
+    body_read = 0  # bytes of the request body that _upload consumed (for _drain)
 
     @property
     def agent(self):
@@ -2362,34 +2440,49 @@ class Handler(BaseHTTPRequestHandler):
     def _upload(self, qs):
         """PUT /api/files?path=...: stream the request body to a file."""
         cfg = self.agent.cfg
-        path = safe_path(cfg, (qs.get("path") or [""])[0], create_dirs=True)
-        ln = int(self.headers.get("Content-Length") or -1)
+        ln = num(self.headers.get("Content-Length") or -1, "Content-Length", int)
         if ln < 0:
             raise ApiError(411, "Content-Length is required")
         if ln > int(cfg.get("max_upload") or 0):
             raise ApiError(413, "file too large (max_upload is %d bytes)" % cfg.get("max_upload"))
-        tmp = path + ".part"
+        try:
+            path = safe_path(cfg, (qs.get("path") or [""])[0], create_dirs=True)
+            fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".part",
+                                       dir=os.path.dirname(path))
+        except OSError as e:
+            raise ApiError(403 if e.errno in (errno.EACCES, errno.EPERM) else 500,
+                           "cannot write %s: %s" % ((qs.get("path") or [""])[0], e.strerror or e))
         digest = hashlib.sha256()
         left = ln
-        with open(tmp, "wb") as f:
-            while left > 0:
-                chunk = self.rfile.read(min(1024 * 1024, left))
-                if not chunk:
-                    raise ApiError(400, "upload cut off")
-                f.write(chunk)
-                digest.update(chunk)
-                left -= len(chunk)
-        os.replace(tmp, path)
-        os.chmod(path, 0o644)
-        chown_to(cfg.get("run_as"), path)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                while left > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, left))
+                    if not chunk:
+                        raise ApiError(400, "upload cut off")
+                    self.body_read += len(chunk)
+                    f.write(chunk)
+                    digest.update(chunk)
+                    left -= len(chunk)
+            os.chmod(tmp, 0o644)
+            chown_to(cfg.get("run_as"), tmp)
+            os.replace(tmp, path)
+        except OSError as e:
+            raise ApiError(403 if e.errno in (errno.EACCES, errno.EPERM) else 500,
+                           "cannot write %s: %s" % (path, e.strerror or e))
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         log.info("upload %s (%d bytes)", path, ln)
         return {"path": path, "size": ln, "sha256": digest.hexdigest()}
 
     def _drain(self, limit=64 * 1024 * 1024):
-        """Read and drop a request body that we refuse, then close the connection."""
+        """Read and drop (the rest of) a request body that we refuse, then close the connection."""
         self.close_connection = True
         try:
-            left = int(self.headers.get("Content-Length") or 0)
+            left = int(self.headers.get("Content-Length") or 0) - self.body_read
         except ValueError:
             return
         if left > limit:
@@ -2425,10 +2518,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True  # do not read a body we will not use
                 return self._send_json(401, {"error": "unauthorized"})
             if path == "/api/files" and method == "PUT":
+                self.body_read = 0
                 try:
                     return self._send_json(200, self._upload(qs))
-                except ApiError:
-                    self._drain()  # read the body first, so the client gets the answer (not a reset)
+                except Exception:
+                    # Read the body first, so the client gets the answer (not a connection reset).
+                    self._drain(int(self.agent.cfg.get("max_upload") or 0))
                     raise
             if path == "/api/files" and method == "GET":
                 return self._download(qs)
@@ -2462,7 +2557,7 @@ class Handler(BaseHTTPRequestHandler):
                 ("POST", "/api/usbipd/start"): lambda: {"notes": a.usb.ensure_usbipd(), **a.usb.usbip_info()},
                 ("POST", "/api/exec"): lambda: run_command(a.cfg, body.get("command"), body.get("timeout", 60),
                                                            body.get("cwd"), body.get("user")),
-                ("GET", "/api/log"): lambda: {"lines": list(LOG_RING)[-int((qs.get("n") or ["200"])[0]):]},
+                ("GET", "/api/log"): lambda: {"lines": list(LOG_RING)[-num((qs.get("n") or ["200"])[0], "n", int):]},
                 ("GET", "/api/config"): lambda: a.public_config(),
                 ("POST", "/api/config"): lambda: a.update_config(body),
             }

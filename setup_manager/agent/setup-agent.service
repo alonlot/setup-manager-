@@ -1,7 +1,9 @@
 [Unit]
 Description=Setup Manager agent (USB/IP, status, remote shell)
 After=network-online.target setup-usbipd.service
-Wants=network-online.target setup-usbipd.service
+Wants=network-online.target
+# No Wants=setup-usbipd.service: the agent starts it itself (ensure_usbipd) when usbipd is not
+# running, so a distro usbipd.service that already holds port 3240 is not fought over.
 
 [Service]
 Type=simple

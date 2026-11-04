@@ -19,14 +19,14 @@ PREFIX=/opt/setup-agent
 CONF_DIR=/etc/setup-agent
 CONF="$CONF_DIR/config.json"
 
-NAME="" TOKEN="" PORT="" RUN_AS="${SUDO_USER:-}" TLS=1 DEPS=0 OPEN_USBIP=0
+NAME="" TOKEN="" PORT="" RUN_AS="${SUDO_USER:-}" RUN_AS_GIVEN=0 TLS=1 DEPS=0 OPEN_USBIP=0
 AUTO_BIND=() PROTECT=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name) NAME="$2"; shift 2;;
     --token) TOKEN="$2"; shift 2;;
     --port) PORT="$2"; shift 2;;
-    --run-as) RUN_AS="$2"; shift 2;;
+    --run-as) RUN_AS="$2"; RUN_AS_GIVEN=1; shift 2;;
     --auto-bind) AUTO_BIND+=("$2"); shift 2;;
     --protect) PROTECT+=("$2"); shift 2;;
     --tls) TLS=1; shift;;
@@ -40,7 +40,7 @@ done
 
 if [[ $EUID -ne 0 ]]; then echo "run as root (sudo $0 ...)" >&2; exit 1; fi
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
-[[ "$RUN_AS" == "root" ]] && RUN_AS=""
+[[ "$RUN_AS" == "root" ]] && RUN_AS=""  # run_as "" means: as the agent itself (root)
 
 if [[ $DEPS -eq 1 ]] && ! command -v usbip >/dev/null; then
   echo ">> installing usbip"
@@ -75,7 +75,8 @@ fi
 
 AUTO_JSON="$(printf '%s\n' "${AUTO_BIND[@]+"${AUTO_BIND[@]}"}")" \
 PROTECT_JSON="$(printf '%s\n' "${PROTECT[@]+"${PROTECT[@]}"}")" \
-NAME="$NAME" TOKEN="$TOKEN" PORT="$PORT" RUN_AS="$RUN_AS" TLS="$TLS" CONF="$CONF" CONF_DIR="$CONF_DIR" \
+NAME="$NAME" TOKEN="$TOKEN" PORT="$PORT" RUN_AS="$RUN_AS" RUN_AS_GIVEN="$RUN_AS_GIVEN" TLS="$TLS" \
+CONF="$CONF" CONF_DIR="$CONF_DIR" \
 OPEN_USBIP="$OPEN_USBIP" \
 python3 - <<'PY'
 import json, os, secrets, socket
@@ -91,7 +92,8 @@ if env["TOKEN"]: cfg["token"] = env["TOKEN"]
 if not cfg.get("token"): cfg["token"] = secrets.token_urlsafe(32)
 if env["PORT"]: cfg["port"] = int(env["PORT"])
 cfg.setdefault("port", 8765)
-if env["RUN_AS"]: cfg["run_as"] = env["RUN_AS"]
+# An explicit --run-as (also "root" or "") replaces the old value; the default ($SUDO_USER) only sets one.
+if env["RUN_AS_GIVEN"] == "1" or env["RUN_AS"]: cfg["run_as"] = env["RUN_AS"]
 cfg.setdefault("run_as", "")
 auto = [x for x in env["AUTO_JSON"].splitlines() if x.strip()]
 prot = [x for x in env["PROTECT_JSON"].splitlines() if x.strip()]
