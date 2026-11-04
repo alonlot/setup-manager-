@@ -543,7 +543,7 @@ update uses SSH, not the agent token.
 | `--dry-run` | Only show the plan |
 | `--only SETUP` | Only these setups (repeatable) |
 | `--ssh-user USER` | SSH user for setups without an SSH target yet. The target is saved per setup (`"ssh": "dev@10.0.0.5"`). |
-| `--ssh-port N` | Another SSH port |
+| `--ssh-port N` | Another SSH port for all setups. Without it, the port that `deploy --ssh-port` saved for each setup (`"ssh_port"`), or 22. |
 | `--keep-tokens` | Do not change the tokens |
 | `--no-install-deps` | Do not install usbip with apt |
 | `--no-require-encryption` | Do not turn on Require encryption |

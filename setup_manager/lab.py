@@ -17,7 +17,9 @@ app, the CLI and the MCP server) in a background thread.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import copy
+import logging
 import getpass
 import os
 import re
@@ -31,6 +33,8 @@ from typing import Any, Awaitable, Iterator
 from .agent_client import AgentClient
 from .config import DEFAULTS, ConfigStore
 from .fleet import Fleet, FleetError
+
+log = logging.getLogger(__name__)
 
 __all__ = ["Lab", "Setup", "Device", "SerialConsole", "Reservation", "CommandResult", "FlashResult",
            "IdentifyResult", "LabError", "DeviceNotFound", "AmbiguousDevice", "BoardBusy", "FlashFailed",
@@ -490,8 +494,16 @@ class Device:
     # -- board actions -----------------------------------------------------------------
     def reset(self, method: str = "auto") -> list[str]:
         """Reset the board through its serial port (auto, rts, dtr, rts+dtr, repl, probe, usb)."""
-        con = self.console
-        return self._call(lambda f, b: f.serial_reset(self.setup_id, b, con.tty, method))["notes"]
+        open_con = self._open_console()
+        tty = open_con.tty if open_con else self.console.tty
+        return self._call(lambda f, b: f.serial_reset(self.setup_id, b, tty, method))["notes"]
+
+    def _open_console(self) -> "SerialConsole | None":
+        """A console of this device that is open now (the baud of the port must not change under it)."""
+        for c in self.lab._consoles:
+            if c.dev.setup_id == self.setup_id and c.dev.busid == self.busid and not c.closed:
+                return c
+        return None
 
     def flash(self, file: str | None, profile: str | None = None, env: dict[str, str] | None = None,
               script: str | None = None, monitor: float | None = None, timeout: float = 300,
@@ -537,7 +549,8 @@ class Device:
     def console(self) -> "SerialConsole":
         """The default console (opened at the first use, 115200 baud, closed with the Lab)."""
         if self._console is None or self._console.closed:
-            self._console = self.serial()
+            # Another open console of this device keeps its baud: do not change it under it.
+            self._console = self.serial(baud=None if self._open_console() else 115200)
         return self._console
 
 
@@ -564,6 +577,7 @@ class Reservation:
         self.key: str | None = None
         self.expires = 0.0
         self._stop = threading.Event()
+        self._lock = threading.Lock()  # one request at a time: renew and release do not cross
         self._thread: threading.Thread | None = None
 
     def __repr__(self) -> str:
@@ -591,39 +605,67 @@ class Reservation:
                 if time.time() >= deadline:
                     raise
                 time.sleep(min(2.0, max(0.1, deadline - time.time())))
-        self.lease, self.key, self.expires = r["lease"], r["key"], r["expires"]
-        self.dev.lab._fleet.leases.setdefault(self.dev.setup_id, {})[self.key] = self.lease
+        self._adopt(r)
         self.dev.lab._reservations.append(self)
         self._stop.clear()
         self._thread = threading.Thread(target=self._renew_loop, name="reservation", daemon=True)
         self._thread.start()
         return self
 
+    def _adopt(self, r: dict[str, Any]) -> None:
+        leases = self.dev.lab._fleet.leases.setdefault(self.dev.setup_id, {})
+        if self.key and self.key != r["key"]:
+            leases.pop(self.key, None)
+        self.lease, self.key, self.expires = r["lease"], r["key"], r["expires"]
+        leases[self.key] = self.lease
+
     def _renew_loop(self) -> None:
         while not self._stop.wait(max(2.0, self.ttl / 3)):
-            try:
-                self.expires = self._request()["expires"]
-            except LabError:
-                pass  # try again; the reservation lasts ttl seconds
+            with self._lock:
+                if self._stop.is_set():
+                    return
+                try:
+                    r = self._request()
+                except DeviceNotFound:
+                    try:
+                        self.dev.refresh()  # the busid changed (re-enumeration): follow the device
+                    except LabError:
+                        pass
+                    continue
+                except LabError:
+                    continue  # try again; the reservation lasts ttl seconds
+                if r["lease"] != self.lease:
+                    # The reservation was lost (released by force, agent restart, long network outage)
+                    # and the agent made a new one: use its lease, else the job locks itself out.
+                    log.warning("reservation of %s by %s was lost and taken again", self.dev.display_name,
+                                self.owner)
+                self._adopt(r)
 
     def release(self) -> None:
         if self.lease is None:
             return
         self._stop.set()
-        leases = self.dev.lab._fleet.leases.get(self.dev.setup_id, {})
-        leases.pop(self.key or "", None)
-        try:
-            self.dev.setup._agent("POST", "/api/release", {"busid": self.dev.busid, "lease": self.lease})
-        finally:
-            self.lease = None
-            if self in self.dev.lab._reservations:
-                self.dev.lab._reservations.remove(self)
+        with self._lock:
+            if self.lease is None:
+                return
+            leases = self.dev.lab._fleet.leases.get(self.dev.setup_id, {})
+            leases.pop(self.key or "", None)
+            try:
+                self.dev.setup._agent("POST", "/api/release", {"busid": self.dev.busid, "lease": self.lease})
+            finally:
+                self.lease = None
+                if self in self.dev.lab._reservations:
+                    self.dev.lab._reservations.remove(self)
 
     def __enter__(self) -> "Reservation":
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        self.release()
+        try:
+            self.release()
+        except LabError:
+            if exc[0] is None:
+                raise  # else keep the error of the with block, which is the real one
 
 
 # --------------------------------------------------------------------------- SerialConsole
@@ -637,6 +679,7 @@ class SerialConsole:
         self.closed = True
         self.log = ""          # everything this console received
         self._pending = ""     # received but not consumed by expect() or read()
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")  # a character can span two reads
 
     def __repr__(self) -> str:
         return f"<SerialConsole {self.dev.display_name} {self.tty} {'closed' if self.closed else 'open'}>"
@@ -664,7 +707,7 @@ class SerialConsole:
     def _fetch(self, wait: float) -> str:
         r = self.dev._call(lambda f, b: f.serial_read(self.dev.setup_id, b, self.tty, self.offset, wait))
         self.offset = r["offset"]
-        text = r["data"].decode("utf-8", "replace")
+        text = self._decoder.decode(r["data"])
         self.log += text
         self._pending += text
         return text

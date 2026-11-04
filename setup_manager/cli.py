@@ -15,6 +15,7 @@ from typing import Any
 
 from . import __version__
 from .config import ConfigStore
+from .agent_client import AgentError
 from .fleet import Fleet, FleetError
 
 AGENT_DIR = Path(__file__).parent / "agent"
@@ -34,7 +35,7 @@ def _run(coro_fn: Any) -> Any:
             return await coro_fn(fleet)
     try:
         return asyncio.run(go())
-    except FleetError as e:
+    except (FleetError, AgentError) as e:
         print(f"error: {e.message}", file=sys.stderr)
         sys.exit(1)
 
@@ -183,6 +184,10 @@ def cmd_flash(args: argparse.Namespace) -> None:
     if args.script:
         opts["script"] = sys.stdin.read() if args.script == "-" else Path(args.script).read_text()
     if args.env:
+        bad = [e for e in args.env if "=" not in e]
+        if bad:
+            print(f"error: --env needs NAME=VALUE, not {bad[0]!r}", file=sys.stderr)
+            sys.exit(2)
         opts["env"] = dict(e.split("=", 1) for e in args.env)
     if args.monitor is not None:
         opts["monitor_seconds"] = args.monitor
@@ -235,7 +240,7 @@ def cmd_trust(args: argparse.Namespace) -> None:
 
     async def go(fl: Fleet) -> Any:
         c = fl.client(args.setup)
-        await c.ensure()
+        await fl._agent_call(c.ensure())
         return {"encrypted": c.encrypted, "fingerprint": c.fingerprint, "pinned": fl.setup(args.setup)["fingerprint"]}
     r = _run(go)
     if args.json:
@@ -371,7 +376,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     if not args.no_add:
         existing = STORE.get_setup(args.name or host)
         fields = {"name": args.name or host, "host": host, "token": agent_token, "fingerprint": fingerprint,
-                  "transport": "tls" if fingerprint else "auto", "ssh": target}
+                  "transport": "tls" if fingerprint else "auto", "ssh": target, "ssh_port": args.ssh_port}
         if existing:
             r = _run(lambda f: f.update_setup(existing["id"], fields))
         else:
@@ -386,7 +391,8 @@ STORE: ConfigStore
 def main(argv: list[str] | None = None) -> None:
     global STORE
     ap = argparse.ArgumentParser(prog="setup-manager", description="Manage USB/IP setup PCs")
-    ap.add_argument("--config", help="config file (default: %(default)s)", default=None)
+    ap.add_argument("--config", default=None,
+                    help="config file (default: $SETUP_MANAGER_CONFIG or ~/.config/setup-manager/config.json)")
     ap.add_argument("--json", action="store_true", help="JSON output")
     ap.add_argument("--version", action="version", version=__version__)
     sub = ap.add_subparsers(dest="cmd")
@@ -433,9 +439,9 @@ def main(argv: list[str] | None = None) -> None:
         p.set_defaults(fn=cmd_simple(action))
 
     p = sub.add_parser("exec", help="run a command on a setup ('all' for every setup)")
+    p.add_argument("--timeout", type=float, default=60, help="seconds (give it before SETUP)")
     p.add_argument("setup")
     p.add_argument("command", nargs=argparse.REMAINDER)
-    p.add_argument("--timeout", type=float, default=60)
     p.set_defaults(fn=cmd_exec)
 
     p = sub.add_parser("identify", help="reset the MCU, read its boot log and guess which MCU it is")
@@ -497,7 +503,7 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("rollout", help="update the agent on every setup PC, with a new unique token for each")
     p.add_argument("--only", action="append", metavar="SETUP", help="only this setup (repeatable)")
     p.add_argument("--ssh-user", help="SSH user for setups without an SSH target (default: ask, or your user)")
-    p.add_argument("--ssh-port", type=int)
+    p.add_argument("--ssh-port", type=int, help="SSH port for all setups (default: the port saved by deploy, or 22)")
     p.add_argument("--keep-tokens", action="store_true", help="do not change the tokens")
     p.add_argument("--no-install-deps", action="store_true", help="do not install usbip with apt on the setups")
     p.add_argument("--no-require-encryption", action="store_true",
@@ -555,11 +561,29 @@ def main(argv: list[str] | None = None) -> None:
     STORE = ConfigStore(args.config or os.environ.get("SETUP_MANAGER_CONFIG"))
     if not getattr(args, "fn", None):
         args = ap.parse_args((argv if argv is not None else sys.argv[1:]) + ["app"])
-    if args.cmd == "exec" and not args.command:
-        ap.error("exec needs a command")
-    if args.cmd == "exec" and args.command[:1] == ["--"]:
-        args.command = args.command[1:]
-    args.fn(args)
+    if args.cmd == "exec":
+        # `exec SETUP --timeout 5 CMD`: argparse gives everything after SETUP to the command.
+        while len(args.command) >= 2 and args.command[0] == "--timeout":
+            try:
+                args.timeout = float(args.command[1])
+            except ValueError:
+                ap.error(f"--timeout needs a number, not {args.command[1]!r}")
+            args.command = args.command[2:]
+        if args.command[:1] == ["--"]:
+            args.command = args.command[1:]
+        if not args.command:
+            ap.error("exec needs a command")
+    try:
+        args.fn(args)
+    except (FleetError, AgentError) as e:
+        print(f"error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:  # a --script file that does not exist, a broken pipe, ...
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"error: {' '.join(e.cmd[:1])} failed (rc={e.returncode})", file=sys.stderr)
+        sys.exit(e.returncode or 1)
 
 
 if __name__ == "__main__":

@@ -234,3 +234,20 @@ def test_firewall_rule(tmp_path, monkeypatch):
     calls = log.read_text().splitlines()
     assert "iptables -I INPUT -p tcp --dport 3240 ! -i lo -m comment --comment setup-agent-usbip -j DROP" in calls
     assert sa.usbip_firewall(False, 3240) == []  # nothing to remove
+
+
+def test_tls_setup_without_a_pin_is_pinned_on_the_first_connection(manager_config, agent):
+    """transport "tls" with an empty fingerprint (after `trust --forget`) must verify from the next connection on."""
+    async def go():
+        async with Fleet(ConfigStore(manager_config)) as f:
+            await f.update_setup("bench", {"transport": "tls", "fingerprint": ""})
+            assert ConfigStore(manager_config).get_setup("bench")["fingerprint"] == cert_fp(agent)
+            c = f.client("bench")
+            await c.ensure()
+            assert c.encrypted and c.fingerprint == cert_fp(agent) and c.ssl is not False
+            # The app keeps its Fleet open: a cleared fingerprint must be pinned again, not left unverified.
+            f.trust("bench", None)
+            assert ConfigStore(manager_config).get_setup("bench")["fingerprint"] == ""
+            await f.refresh("bench")
+            assert ConfigStore(manager_config).get_setup("bench")["fingerprint"] == cert_fp(agent)
+    run(go())

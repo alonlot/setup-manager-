@@ -190,7 +190,7 @@ class MainWindow(Adw.ApplicationWindow):
                 self.sidebar.remove(row)
                 page = self.pages.pop(f"setup:{sid}", None)
                 if page:
-                    page.on_hidden()
+                    page.on_removed()
         for s in setups:
             row = self.setup_rows.get(s["id"])
             if row is None:

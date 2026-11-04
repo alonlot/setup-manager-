@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import os
 import socket
+import warnings
 from typing import Any, Iterator
 
 import pytest
 
-from .lab import Device, Lab
+from .lab import Device, Lab, LabError
 
 
 def pytest_addoption(parser: Any) -> None:
@@ -56,11 +57,18 @@ def board(request: Any, lab: Lab) -> Iterator[Device]:
         res = dev.reserve(owner=f"{lab.owner} {request.node.nodeid}"[:80], ttl=kw.get("ttl", 600),
                           wait=request.config.getoption("--lab-wait") if wait is None else wait)
     dev._console = None
-    baud = kw.get("baud", 115200)
-    if baud != 115200:
-        dev._console = dev.serial(baud)
     request.node._lab_devices = getattr(request.node, "_lab_devices", []) + [dev]
     try:
+        # Open the console before the test, so that the boot banner after board.flash() is not lost.
+        baud = kw.get("baud", 115200)
+        try:
+            dev._console = dev.serial(baud)
+        except LabError as e:
+            if "baud" in kw:
+                raise  # the test asked for a serial port and it cannot be opened
+            # No serial port, or it cannot be opened now: board.console tries again, and raises,
+            # only if the test uses it.
+            warnings.warn(f"{dev.display_name}: serial port not opened before the test: {e}", stacklevel=1)
         yield dev
     finally:
         if dev._console is not None:

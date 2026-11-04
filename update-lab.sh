@@ -19,7 +19,7 @@ ARGS=()
 for a in "$@"; do
   case "$a" in
     --skip-manager) SKIP=1;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0;;
     *) ARGS+=("$a");;
   esac
 done

@@ -140,7 +140,7 @@ def discover_dialog(win: "MainWindow") -> None:
             row = Adw.ActionRow(title=a.get("name") or a["host"], use_markup=False,
                                 subtitle=f"{a['host']}:{a.get('port')}  ·  {a.get('hostname')}  ·  v{a.get('version')}")
             if a.get("known_as"):
-                row.add_suffix(Gtk.Label(label=f"added as {a['known_as']}", css_classes=["pill", "green"],
+                row.add_suffix(Gtk.Label(label=f"added as {a['known_as']}", css_classes=["sm-pill", "green"],
                                          valign=Gtk.Align.CENTER))
             else:
                 b = Gtk.Button(label="Add…", valign=Gtk.Align.CENTER, css_classes=["suggested-action"])

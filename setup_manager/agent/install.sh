@@ -33,7 +33,7 @@ while [[ $# -gt 0 ]]; do
     --plain) TLS=0; shift;;
     --open-usbip) OPEN_USBIP=1; shift;;
     --install-deps) DEPS=1; shift;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; exit 1;;
   esac
 done

@@ -36,7 +36,7 @@ BUILTIN_FLASH_PROFILES: dict[str, dict[str, Any]] = {
         "monitor_seconds": 3,
         "script": (
             'openocd -f "$SM_INTERFACE" ${SM_SERIAL:+-c "adapter serial $SM_SERIAL"} -f "$SM_TARGET" \\\n'
-            '  -c "program $SM_FILE verify reset exit"\n'),
+            '  -c "program {$SM_FILE} verify reset exit"\n'),
         "help": "Set SM_TARGET to your target config (.elf, .hex or .bin at the flash start).",
     },
     "pyOCD (CMSIS-DAP, DAPLink, ST-LINK)": {
@@ -58,7 +58,7 @@ BUILTIN_FLASH_PROFILES: dict[str, dict[str, Any]] = {
         "monitor_seconds": 3,
         "script": (
             'CMD=$(mktemp)\n'
-            'case "$SM_FILE_EXT" in bin) LOAD="loadbin $SM_FILE $SM_ADDRESS" ;; *) LOAD="loadfile $SM_FILE" ;; esac\n'
+            'case "$SM_FILE_EXT" in bin) LOAD="loadbin \\"$SM_FILE\\" $SM_ADDRESS" ;; *) LOAD="loadfile \\"$SM_FILE\\"" ;; esac\n'
             'printf "connect\\nr\\n%s\\nr\\ng\\nexit\\n" "$LOAD" > "$CMD"\n'
             'JLinkExe ${SM_SERIAL:+-USB $SM_SERIAL} -if SWD -speed 4000 -device "$SM_DEVICE" -autoconnect 1 '
             '-NoGui 1 -CommandFile "$CMD"\n'

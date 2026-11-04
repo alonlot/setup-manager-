@@ -37,6 +37,10 @@ class Page:
     def on_hidden(self) -> None:
         pass
 
+    def on_removed(self) -> None:
+        """The page goes away for good (its setup was deleted)."""
+        self.on_hidden()
+
 
 # --------------------------------------------------------------------------- overview
 
@@ -304,6 +308,13 @@ class SetupPage(Page):
             self._timer = None
         self.serial.set_visible_now(False)
 
+    def on_removed(self) -> None:
+        self.on_hidden()
+        if self.serial.is_open:
+            self.serial.close()
+        for i in range(self.tabs.get_n_pages()):
+            self.tabs.get_nth_page(i).get_child().close()
+
     def open_serial(self, busid: str) -> None:
         """Show the Serial tab with the port of this device, and open it."""
         self.stack.set_visible_child_name("serial")
@@ -409,6 +420,7 @@ class SetupPage(Page):
     def _terminal_tab(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.tabs = Adw.TabView(vexpand=True)
+        self.tabs.connect("close-page", self._close_tab)
         bar = Adw.TabBar(view=self.tabs, autohide=False)
         add = Gtk.Button(icon_name="tab-new-symbolic", tooltip_text="New terminal tab", css_classes=["flat"])
         add.connect("clicked", lambda *_: self.new_terminal())
@@ -429,6 +441,11 @@ class SetupPage(Page):
         tab.page = page
         self.tabs.set_selected_page(page)
         tab.term.grab_focus()
+
+    def _close_tab(self, view: Adw.TabView, page: Adw.TabPage) -> bool:
+        page.get_child().close()
+        view.close_page_finish(page, True)
+        return True  # Gdk.EVENT_STOP: we called close_page_finish ourselves
 
     # -- info / log tabs -------------------------------------------------------
     def load_info(self) -> None:

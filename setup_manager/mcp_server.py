@@ -14,6 +14,7 @@ import contextlib
 from typing import Any
 
 from .config import ConfigStore
+from .agent_client import AgentError
 from .fleet import Fleet, FleetError
 
 try:  # mcp >= 2
@@ -72,7 +73,7 @@ async def _call(fn: Any) -> Any:
     fleet = await _fleet()
     try:
         return await fn(fleet)
-    except FleetError as e:
+    except (FleetError, AgentError) as e:
         # ToolError: the SDK sends this text to the model (other errors are hidden).
         raise ToolError(e.message) from None
 

@@ -11,6 +11,7 @@ import copy
 import json
 import os
 import re
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
@@ -45,7 +46,7 @@ DEFAULTS: dict[str, Any] = {
 }
 
 SETUP_FIELDS = {"name", "host", "port", "token", "tls", "verify_tls", "notes", "tags", "usbip_port", "fingerprint",
-                "transport", "ssh"}
+                "transport", "ssh", "ssh_port"}
 
 
 def config_dir() -> Path:
@@ -101,14 +102,18 @@ class ConfigStore:
         with self._lock:
             data = self.data()
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp")
             try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
                 os.chmod(tmp, 0o600)
-            except OSError:
-                pass
-            os.replace(tmp, self.path)
+                os.replace(tmp, self.path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
             self._mtime = self.path.stat().st_mtime
 
     # -- setups ----------------------------------------------------------------
@@ -128,6 +133,7 @@ class ConfigStore:
             "transport": s.get("transport") or ("tls" if s.get("tls") else "auto"),
             # SSH target for deploy / rollout, e.g. "dev@192.168.1.20" (empty = ask, or USER@host).
             "ssh": s.get("ssh") or "",
+            "ssh_port": int(s["ssh_port"]) if s.get("ssh_port") else None,
             "notes": s.get("notes", ""),
             "tags": list(s.get("tags") or []),
             "usbip_port": int(s.get("usbip_port") or 3240),

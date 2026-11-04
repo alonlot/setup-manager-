@@ -145,3 +145,40 @@ def test_unreachable_pc(manager_config, remote, monkeypatch):
     o, out = opts(only=["bench2"])
     assert Rollout(ConfigStore(manager_config), o).run() == 2
     assert "SSH to dev@10.255.255.1 failed" in out.getvalue()
+
+
+def test_only_one_setup_keeps_the_shared_token_and_keep_attached(manager_config, remote, monkeypatch):
+    monkeypatch.setenv("FAKE_SUDO_PASSWORD", "pw")
+
+    async def attach():
+        async with Fleet(ConfigStore(manager_config)) as f:
+            await f.attach("bench", "1-2")
+            await f.set_sticky("bench", "1-2", True)
+    asyncio.run(attach())
+
+    o, out = opts(only=["bench"])
+    assert Rollout(ConfigStore(manager_config), o).run() == 0, out.getvalue()
+    cfg = ConfigStore(manager_config)
+    # bench2 still uses the shared default token: it must stay until every setup has its own.
+    assert cfg.data()["agent_defaults"]["token"] == "old-shared-token"
+    assert cfg.data()["require_encryption"] is False
+    # The device was detached for the update and attached again: "keep attached" stays on.
+    assert "attached again: 1-2" in out.getvalue()
+    assert [(x["setup"], x["busid"]) for x in cfg.sticky()] == [("bench", "1-2")]
+
+    async def cleanup():
+        async with Fleet(ConfigStore(manager_config)) as f:
+            await f.detach("bench", "1-2")
+    asyncio.run(cleanup())
+
+
+def test_ssh_port_is_saved_per_setup(manager_config, remote, monkeypatch):
+    monkeypatch.setenv("FAKE_SUDO_PASSWORD", "pw")
+    data = json.loads(manager_config.read_text())
+    data["setups"][0]["ssh_port"] = 2222
+    manager_config.write_text(json.dumps(data))
+    o, out = opts(only=["bench"])
+    assert Rollout(ConfigStore(manager_config), o).run() == 0, out.getvalue()
+    log = remote["log"].read_text()
+    assert "-p 2222" in log
+    assert ConfigStore(manager_config).get_setup("bench")["ssh_port"] == 2222

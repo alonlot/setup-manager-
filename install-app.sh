@@ -11,6 +11,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ME="$(id -un)"
 APP_ID=io.github.alonlot.SetupManager
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 VENV="$DATA/setup-manager/venv"
@@ -26,7 +27,7 @@ for arg in "$@"; do
       sudo rm -f /etc/sudoers.d/setup-manager
       echo "Setup Manager removed (your config in ~/.config/setup-manager is kept)."
       exit 0;;
-    -h|--help) sed -n '2,11p' "$0"; exit 0;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0;;
     *) echo "unknown option: $arg" >&2; exit 1;;
   esac
 done
@@ -87,8 +88,8 @@ command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "$DAT
 USBIP="$(command -v usbip || true)"
 MODPROBE="$(command -v modprobe || echo /usr/sbin/modprobe)"
 if [[ -n "$USBIP" ]]; then
-  echo ">> allowing '$USER' to run usbip and modprobe without a password (sudo)"
-  RULE="$USER ALL=(root) NOPASSWD: $USBIP, $MODPROBE vhci-hcd"
+  echo ">> allowing '$ME' to run usbip and modprobe without a password (sudo)"
+  RULE="$ME ALL=(root) NOPASSWD: $USBIP, $MODPROBE vhci-hcd"
   echo "$RULE" | sudo tee /etc/sudoers.d/setup-manager >/dev/null
   sudo chmod 440 /etc/sudoers.d/setup-manager
   sudo visudo -cf /etc/sudoers.d/setup-manager >/dev/null || { sudo rm -f /etc/sudoers.d/setup-manager; echo "!! sudo rule rejected"; }
@@ -98,9 +99,9 @@ else
   echo "!! usbip not found. Attach will not work until you install it (Ubuntu: linux-tools-generic)."
 fi
 
-if getent group dialout >/dev/null && ! id -nG "$USER" | grep -qw dialout; then
-  echo ">> adding $USER to the dialout group (serial ports of attached devices; log out and in once)"
-  sudo usermod -aG dialout "$USER"
+if getent group dialout >/dev/null && ! id -nG "$ME" | grep -qw dialout; then
+  echo ">> adding $ME to the dialout group (serial ports of attached devices; log out and in once)"
+  sudo usermod -aG dialout "$ME"
 fi
 
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "!! add $BIN to your PATH to use the setup-manager command";; esac

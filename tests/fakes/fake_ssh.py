@@ -24,7 +24,7 @@ while i < len(args) and args[i].startswith("-"):
 target, cmd = args[i], " ".join(args[i + 1:])
 host = target.split("@")[-1]
 with open(os.environ["FAKE_SSH_LOG"], "a") as f:
-    f.write(f"{target} {cmd}\n")
+    f.write(f"{' '.join(args[:i])} {target} {cmd}\n".lstrip())
 agents = json.loads(os.environ["FAKE_AGENTS"])
 if host not in agents:
     print(f"ssh: connect to host {host} port 22: Connection refused")

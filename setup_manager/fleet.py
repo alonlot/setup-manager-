@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import getpass
 import json
 import logging
@@ -57,6 +58,16 @@ def used_by_text(d: dict[str, Any]) -> str:
     if u.get("ips"):
         return "one of " + ", ".join(u["ips"])
     return "another client"
+
+
+def _pid_alive(pid: Any) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class FleetError(Exception):
@@ -137,6 +148,8 @@ class Fleet:
     def _pin(self, sid: str, fp: str) -> None:
         """Trust on first use: save the fingerprint of the agent's certificate (like SSH known_hosts)."""
         try:
+            if (self.store.get_setup(sid) or {}).get("fingerprint") == fp:
+                return  # pinned by a parallel probe (status and usb run together)
             self.store.update_setup(sid, {"fingerprint": fp})
             log.warning("first TLS connection to %s: trusting its certificate sha256 %s", sid, fp)
         except ConfigError:
@@ -272,7 +285,12 @@ class Fleet:
                             p["name"] = d["name"]
                             p["serial"] = d.get("serial")
                     break
-        stale = [k for k, t in tunnels.items() if k not in live and time.time() - t.get("at", 0) > 60]
+        # A record is stale when its port is gone AND its helper process is gone. When `usbip port`
+        # itself failed (sudo, timeout), nothing is known: keep every record, else the encrypted
+        # attachments become orphans ("in use by <this PC>") that nobody can detach.
+        stale = [] if self.local.last_error else [
+            k for k, t in tunnels.items()
+            if k not in live and time.time() - t.get("at", 0) > 60 and not _pid_alive(t.get("pid"))]
         if stale:
             for k in stale:
                 tunnels.pop(k, None)
@@ -291,7 +309,7 @@ class Fleet:
 
     async def usb(self, ref: str, include_hubs: bool = False) -> list[dict[str, Any]]:
         setup = self.setup(ref)
-        data, ports = await asyncio.gather(self.client(setup).usb(include_hubs), self.local_ports())
+        data, ports = await asyncio.gather(self._agent_call(self.client(setup).usb(include_hubs)), self.local_ports())
         sticky = {x["busid"] for x in self.store.sticky() if x.get("setup") == setup["id"]}
         devices = data.get("devices", [])
         results = self.store.data().get("mcu_results") or {}
@@ -310,7 +328,7 @@ class Fleet:
                 d["local_ttys"] = self._local_ttys(p)
                 u = d.get("used_by") or {}
                 if u.get("client") != self.client_name:
-                    asyncio.ensure_future(self._claim(setup, d["busid"]))  # tell the setup who has it
+                    await self._claim(setup, d["busid"])  # tell the setup who has it
             else:
                 d["state_detail"] = {"available": "not shared", "bound": "shared, waiting for a client",
                                      "error": "usbip error"}.get(d["state"], d["state"])
@@ -351,7 +369,8 @@ class Fleet:
                 return {"message": f"already attached on port {p['port']}", "port": p}
             dev = await self._agent_call(self._device(setup, busid))
             if dev["state"] == "in_use":
-                if not force:
+                ours = (dev.get("used_by") or {}).get("client") == self.client_name
+                if not force and not ours:
                     raise FleetError(f"{busid} ({dev['name']}) is in use by {used_by_text(dev)}. "
                                      "Use force to take it.", 409)
                 await self.unbind(setup["id"], busid)
@@ -425,6 +444,14 @@ class Fleet:
                 except UsbipError as e:
                     raise FleetError(f"detach failed: {e}", 500) from None
             else:
+                try:
+                    dev = await self._device(setup, busid)
+                except (AgentError, FleetError):
+                    dev = None
+                u = (dev or {}).get("used_by") or {}
+                if dev and dev.get("state") == "in_use" and u.get("client") and u["client"] != self.client_name:
+                    raise FleetError(f"{busid} ({dev['name']}) is not attached to this PC: it is in use by "
+                                     f"{used_by_text(dev)}", 409)
                 msgs.append("not attached to this PC")
             try:
                 await self.client(setup).release(busid)
@@ -676,6 +703,8 @@ class Fleet:
             await self.client(setup).claim(busid, self.client_name)
         except AgentError as e:
             log.debug("claim of %s failed: %s", busid, e.message)
+        except RuntimeError as e:  # the session is closed (the fleet is closing)
+            log.debug("claim of %s skipped: %s", busid, e)
 
     async def set_nickname(self, ref: str, busid: str, name: str) -> dict[str, Any]:
         """Give a device a name (stored on the setup PC, so all managers see it). Empty name = remove."""
@@ -799,12 +828,13 @@ class Fleet:
         if since is None or since < 0:
             since = (await self.serial_read(ref, busid, tty, since=-1))["offset"]
         text, offset = "", since
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
         deadline = time.time() + max(0.1, timeout)
         while True:
             left = deadline - time.time()
             r = await self.serial_read(ref, busid, tty, since=offset, wait=max(0.0, min(5.0, left)))
             offset = r["offset"]
-            text += r["data"].decode("utf-8", "replace")
+            text += decoder.decode(r["data"])
             m = rx.search(text)
             if m:
                 return {"matched": True, "match": m.group(0), "groups": list(m.groups()),
@@ -941,8 +971,8 @@ class Fleet:
         env = dict(os.environ, SM_FILE=file or "", SM_FILE_EXT=os.path.splitext(file or "")[1].lstrip(".").lower(),
                    SM_TTY=paths[0] if paths else "", SM_TTYS=" ".join(paths), SM_BUSID=dev["busid"],
                    SM_VID=dev["vid"], SM_PID=dev["pid"], SM_SERIAL=dev.get("serial") or "",
-                   SM_SETUP=setup["name"], SM_PHASE="flash", SM_WHERE="manager",
-                   **{str(k): str(v) for k, v in (opts.get("env") or {}).items()})
+                   SM_SETUP=setup["name"], SM_PHASE="flash", SM_WHERE="manager")
+        env.update({str(k): str(v) for k, v in (opts.get("env") or {}).items()})
         hub = self.local_hub
         timeout = float(opts.get("timeout") or 300)
 
@@ -985,12 +1015,13 @@ class Fleet:
         r["setup"] = setup["id"]
         return r
 
-    async def exec_many(self, refs: list[str] | None, command: str, timeout: float = 60) -> list[dict[str, Any]]:
+    async def exec_many(self, refs: list[str] | None, command: str, timeout: float = 60,
+                        user: str | None = None) -> list[dict[str, Any]]:
         targets = [self.setup(r) for r in refs] if refs else self.store.setups()
 
         async def one(s: dict[str, Any]) -> dict[str, Any]:
             try:
-                return await self.exec(s["id"], command, timeout)
+                return await self.exec(s["id"], command, timeout, user=user)
             except FleetError as e:
                 return {"setup": s["id"], "error": e.message, "exit_code": None}
 
@@ -1085,6 +1116,7 @@ class Fleet:
         except ConfigError as e:
             raise FleetError(str(e), 404) from None
         self._resolve_cache.pop(s["host"], None)
+        self._transport.pop(s["id"], None)
         entry = await self.refresh(s["id"])
         return {"setup": ConfigStore.redact(s), "online": entry.get("online"), "error": entry.get("error")}
 
