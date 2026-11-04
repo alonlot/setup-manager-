@@ -248,13 +248,17 @@ def _put(agent, path, body, content_length=None):
     s.sendall(head.encode() + body)
     try:
         out = b""
-        while True:
+        while True:  # the status line, the headers and the whole body (as told by Content-Length)
             chunk = s.recv(65536)
             if not chunk:
                 break
             out += chunk
-            if b"\r\n\r\n" in out:
-                break
+            head, sep, rest = out.partition(b"\r\n\r\n")
+            if sep:
+                import re
+                m = re.search(rb"(?i)content-length: *(\d+)", head)
+                if m and len(rest) >= int(m.group(1)):
+                    break
     except OSError:
         out = b""
     s.close()
