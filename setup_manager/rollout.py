@@ -17,7 +17,6 @@ import getpass
 import os
 import secrets
 import shlex
-import shutil
 import subprocess
 import sys
 import time
@@ -251,7 +250,8 @@ class Rollout:
                 enc = self._fleet(lambda f: _encrypted(f, sid))
                 usbip = st.get("usbip") or {}
                 if not usbip.get("usbip_installed"):
-                    r.steps.append("WARNING: usbip is not installed on the setup PC")
+                    r.steps.append("WARNING: usbip does not work on the setup PC: "
+                                   + (usbip.get("usbip_hint") or "re-run install.sh with --install-deps"))
                 elif not usbip.get("usbipd_running"):
                     r.steps.append("WARNING: usbipd is not running on the setup PC")
                 r.steps.append(f"agent {st.get('version')} online" + (", TLS + USB/IP tunnel" if enc else ""))
@@ -264,8 +264,11 @@ class Rollout:
     # -- this PC -------------------------------------------------------------------------
     def check_this_pc(self) -> list[str]:
         notes = []
-        if not shutil.which("usbip"):
-            notes.append("usbip is not installed on this PC (Ubuntu: sudo apt install linux-tools-generic)")
+        from .usbip_local import LocalUsbip
+        local = LocalUsbip({"sudo": False}).info()  # "usbip version" needs no root
+        if not local["found"]:
+            notes.append("usbip does not work on this PC: "
+                         + (local.get("hint") or f"Ubuntu: sudo apt install linux-tools-{os.uname().release}"))
         if not os.path.exists("/etc/sudoers.d/setup-manager") and os.geteuid() != 0:
             notes.append("no sudo rule for usbip on this PC: run ./install-app.sh")
         if not os.path.exists("/sys/module/vhci_hcd") and not os.path.exists("/sys/devices/platform/vhci_hcd.0"):

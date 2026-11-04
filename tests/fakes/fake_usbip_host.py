@@ -7,6 +7,9 @@ root = os.environ["FAKE_SYSFS"]
 devs = os.path.join(root, "bus", "usb", "devices")
 drivers = os.path.join(root, "bus", "usb", "drivers")
 args = sys.argv[1:]
+if args == ["version"]:
+    print("usbip (usbip-utils 2.0)")
+    sys.exit(0)
 if len(args) == 3 and args[0] in ("bind", "unbind") and args[1] == "-b":
     busid = args[2]
     d = os.path.join(devs, busid)

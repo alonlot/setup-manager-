@@ -41,6 +41,7 @@ def test_status(agent):
     assert st["usb_count"] == 4  # hub hidden
     assert st["memory"]["total"] > 0
     assert "usbipd_running" in st["usbip"]
+    assert st["usbip"]["usbip_installed"] is True
 
 
 def test_usb_list(agent):
@@ -332,3 +333,81 @@ def test_tls_front_survives_accept_errors(monkeypatch):
     monkeypatch.setattr(sa.time, "sleep", lambda t: None)
     front.serve()  # returns only because the socket was closed, after a retry
     assert len(calls) == 2
+
+
+UBUNTU_WRAPPER = """#!/bin/sh
+echo "WARNING: usbip not found for kernel 6.8.0-45" >&2
+echo "" >&2
+echo "  You may need to install the following packages for this specific kernel:" >&2
+echo "    linux-tools-6.8.0-45-generic" >&2
+exit 2
+"""
+
+
+def _kernel_tools(tmp_path, real=True):
+    """A broken Ubuntu wrapper /usr/bin/usbip, and (real=True) the real binary in the kernel tools dir."""
+    import sys
+    from conftest import FAKES
+    wrapper = tmp_path / "bin" / "usbip"
+    wrapper.parent.mkdir()
+    wrapper.write_text(UBUNTU_WRAPPER)
+    wrapper.chmod(0o755)
+    old = tmp_path / "linux-tools" / "5.15.0-9-generic" / "usbip"  # older tools that do not run
+    old.parent.mkdir(parents=True)
+    old.write_text("#!/bin/sh\nexit 1\n")
+    old.chmod(0o755)
+    if real:
+        tool = tmp_path / "linux-tools" / "6.8.0-45-generic" / "usbip"
+        tool.parent.mkdir()
+        tool.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKES / "fake_usbip_host.py"}" "$@"\n')
+        tool.chmod(0o755)
+    return {"usbip_cmd": str(wrapper), "kernel_tools_dirs": [str(tmp_path / "linux-tools" / "*")]}
+
+
+def test_bind_works_when_the_ubuntu_wrapper_misses_the_kernel_tools(tmp_path, sysfs):
+    from conftest import start_agent, stop_agent
+    info = start_agent(tmp_path, sysfs, **_kernel_tools(tmp_path))
+    try:
+        code, st = call(info, "GET", "/api/status")
+        assert code == 200
+        u = st["usbip"]
+        assert u["usbip_installed"] is True, u
+        assert u["usbip_path"] == str(tmp_path / "linux-tools" / "6.8.0-45-generic" / "usbip")
+        assert "linux-tools-" in u["usbip_hint"] and u["usbip_error"] is None
+        code, r = call(info, "POST", "/api/usb/bind", {"busid": "1-1"})
+        assert code == 200 and r["device"]["bound"], r
+    finally:
+        stop_agent(info)
+
+
+def test_bind_without_kernel_tools_gives_the_apt_hint(tmp_path, sysfs):
+    from conftest import start_agent, stop_agent
+    info = start_agent(tmp_path, sysfs, **_kernel_tools(tmp_path, real=False))
+    try:
+        _, st = call(info, "GET", "/api/status")
+        u = st["usbip"]
+        assert u["usbip_installed"] is False
+        assert "not found for kernel" in u["usbip_error"]
+        assert "sudo apt install linux-tools-" in u["usbip_hint"]
+        code, r = call(info, "POST", "/api/usb/bind", {"busid": "1-1"})
+        assert code == 500
+        assert "not found for kernel" in r["error"] and "sudo apt install linux-tools-" in r["error"], r
+    finally:
+        stop_agent(info)
+
+
+def test_kernel_tools_order(tmp_path):
+    sa = _sa()
+    assert sorted(["6.8.0-9-generic", "6.10.0-1-generic", "6.8.0-45-generic"], key=sa.version_key) == \
+        ["6.8.0-9-generic", "6.8.0-45-generic", "6.10.0-1-generic"]
+    for d in ("linux-tools/6.8.0-45-generic", "linux-tools/6.11.0-8-generic", "linux-tools/6.9.0-1-generic",
+              "linux-tools-6.5.0-3", "linux-tools/nothing-here"):
+        (tmp_path / d).mkdir(parents=True)
+        if d != "linux-tools/nothing-here":
+            (tmp_path / d / "usbip").write_text("#!/bin/sh\n")
+            (tmp_path / d / "usbip").chmod(0o755)
+    dirs = [str(tmp_path / "linux-tools" / "*"), str(tmp_path / "linux-tools-*")]
+    got = [os.path.basename(os.path.dirname(p)) for p in sa.kernel_tools_candidates("usbip", dirs, "6.5.0-3-generic")]
+    assert got == ["linux-tools-6.5.0-3", "6.11.0-8-generic", "6.9.0-1-generic", "6.8.0-45-generic"]
+    got = sa.kernel_tools_candidates("usbip", dirs, "7.0.0-1-generic")
+    assert os.path.basename(os.path.dirname(got[0])) == "6.11.0-8-generic"

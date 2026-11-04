@@ -39,6 +39,7 @@ import base64
 import collections
 import errno
 import fcntl
+import glob
 import hashlib
 import hmac
 import json
@@ -94,6 +95,10 @@ DEFAULTS = {
     "shell": "/bin/bash",
     "usbip_cmd": "usbip",
     "usbipd_cmd": "usbipd",
+    # Where the real usbip/usbipd binaries of the kernel tools are (Ubuntu). /usr/bin/usbip there is a
+    # wrapper that fails when the tools of the running kernel are missing; the agent then uses these.
+    # The env var SETUP_AGENT_TOOLS_DIRS (dirs separated by ":") replaces the default.
+    "kernel_tools_dirs": [],
     # Start usbipd and load usbip-host when they are not running.
     "manage_usbipd": True,
     # Rules: "1-1.2" (busid), "0483:374b" (vid:pid), "0483:*", "0483:374b:SERIAL"
@@ -177,6 +182,71 @@ def split_cmd(value):
     return shlex.split(str(value))
 
 
+# Ubuntu: /usr/bin/usbip(d) of linux-tools-common runs /usr/lib/linux-tools/<kernel>/usbip(d) and
+# prints "WARNING: usbip not found for kernel ..." (rc=2) when the tools of this kernel are missing.
+KERNEL_TOOLS_MSG = "not found for kernel"
+KERNEL_TOOLS_DIRS = ["/usr/lib/linux-tools/*", "/usr/lib/linux-tools-*"]
+
+
+def kernel_tools_hint():
+    return "install the usbip tools for this kernel: sudo apt install linux-tools-%s" % os.uname().release
+
+
+def version_key(text):
+    """Sort key for kernel versions: "6.8.0-45-generic" -> (6, 8, 0, 45)."""
+    return tuple(int(n) for n in re.findall(r"\d+", text))
+
+
+def kernel_tools_candidates(name, dirs=None, release=None):
+    """The real usbip/usbipd binaries: the one of the running kernel first, then the newest."""
+    if dirs is None:
+        env = os.environ.get("SETUP_AGENT_TOOLS_DIRS")
+        dirs = env.split(":") if env else KERNEL_TOOLS_DIRS
+    release = release or os.uname().release
+    found = []
+    for pattern in dirs:
+        for d in glob.glob(pattern):
+            path = os.path.join(d, name)
+            if path not in found and os.path.isfile(path) and os.access(path, os.X_OK):
+                found.append(path)
+
+    def key(path):
+        ver = os.path.basename(os.path.dirname(path))
+        ver = ver[len("linux-tools-"):] if ver.startswith("linux-tools-") else ver
+        this_kernel = ver == release or release.startswith(ver + "-")
+        return (this_kernel, version_key(ver))
+    return sorted(found, key=key, reverse=True)
+
+
+def try_tool(argv, timeout=10):
+    """Run a command, return (ok, output). A missing command is not ok."""
+    try:
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, "%s: %s" % (argv[0], e)
+    return p.returncode == 0, p.stdout.decode(errors="replace").strip()
+
+
+def resolve_tool(cmd, name, probe_args, dirs=None):
+    """Find a usbip/usbipd command that works. Returns (argv, ok, error).
+
+    A command of one word (default "usbip") that is missing or is the Ubuntu wrapper without the
+    tools of this kernel is replaced by the real binary in the kernel tools dirs. The usbip tools
+    of another kernel version work: they use sysfs and the usbipd protocol, which do not change.
+    """
+    argv = split_cmd(cmd)
+    ok, out = try_tool(argv + probe_args)
+    if ok:
+        return argv, True, ""
+    missing = argv and shutil.which(argv[0]) is None
+    if len(argv) == 1 and (missing or KERNEL_TOOLS_MSG in out):
+        for path in kernel_tools_candidates(name, dirs):
+            if try_tool([path] + probe_args)[0]:
+                return [path], True, out
+    return argv, False, out
+
+
 def match_rule(rule, dev):
     """Return True if a rule ("busid", "vid:pid", "vid:*", "vid:pid:serial") matches a device."""
     rule = str(rule).strip().lower()
@@ -254,18 +324,47 @@ class UsbManager:
         self.base = os.path.join(cfg["sysfs_root"], "bus", "usb", "devices")
         self.ids = UsbIds()
         self.lock = threading.Lock()
+        self._usbip = None  # (argv, ok, error, time) of resolve_tool
+        self._usbip_lock = threading.Lock()
 
     # -- usbip / usbipd ------------------------------------------------------
+    def _tools_dirs(self):
+        return self.cfg.get("kernel_tools_dirs") or None
+
+    def resolve_usbip(self, force=False):
+        """The usbip command to run (cached; a failed result is checked again after 30 s)."""
+        with self._usbip_lock:
+            r = self._usbip
+            if force or r is None or (not r[1] and time.time() - r[3] > 30):
+                argv, ok, err = resolve_tool(self.cfg["usbip_cmd"], "usbip", ["version"], self._tools_dirs())
+                if ok and err:
+                    log.warning("usbip wrapper does not work (%s), using %s", err.splitlines()[0], argv[0])
+                r = self._usbip = (argv, ok, err, time.time())
+            return r
+
     def usbip(self, *args, timeout=20):
-        cmd = split_cmd(self.cfg["usbip_cmd"]) + list(args)
-        try:
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
-        except FileNotFoundError:
-            raise ApiError(500, "usbip is not installed on this PC (command: %s)" % cmd[0])
-        except subprocess.TimeoutExpired:
-            raise ApiError(504, "usbip %s timed out" % " ".join(args))
-        out = p.stdout.decode(errors="replace").strip()
-        return p.returncode, out
+        argv = self.resolve_usbip()[0]
+        for attempt in (1, 2):
+            cmd = argv + list(args)
+            try:
+                p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+                out = p.stdout.decode(errors="replace").strip()
+                rc = p.returncode
+            except FileNotFoundError:
+                rc, out = 127, "usbip is not installed on this PC (command: %s)" % cmd[0]
+            except subprocess.TimeoutExpired:
+                raise ApiError(504, "usbip %s timed out" % " ".join(args))
+            if rc == 0 or (rc != 127 and KERNEL_TOOLS_MSG not in out) or attempt == 2:
+                break
+            new = self.resolve_usbip(force=True)[0]  # e.g. the kernel tools were removed
+            if new == argv:
+                break
+            argv = new
+        if rc == 127:
+            raise ApiError(500, "%s. Re-run install.sh with --install-deps, or %s" % (out, kernel_tools_hint()))
+        if rc != 0 and KERNEL_TOOLS_MSG in out:
+            out += "\nHint: " + kernel_tools_hint()
+        return rc, out
 
     def usbipd_running(self):
         try:
@@ -298,10 +397,13 @@ class UsbManager:
                 if started:
                     notes.append("started setup-usbipd.service")
             if not started:
+                argv, ok, err = resolve_tool(self.cfg["usbipd_cmd"], "usbipd", ["--version"], self._tools_dirs())
+                if not ok and KERNEL_TOOLS_MSG in err:
+                    notes.append("usbipd: %s. Hint: %s" % (err.splitlines()[0], kernel_tools_hint()))
                 try:
-                    subprocess.run(split_cmd(self.cfg["usbipd_cmd"]) + ["-D"], timeout=10,
+                    subprocess.run(argv + ["-D"], timeout=10,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    notes.append("started usbipd -D")
+                    notes.append("started %s -D" % " ".join(argv))
                 except (OSError, subprocess.TimeoutExpired) as e:
                     notes.append("could not start usbipd: %s" % e)
             for _ in range(20):
@@ -313,8 +415,16 @@ class UsbManager:
         return notes
 
     def usbip_info(self):
+        argv, ok, err = self.resolve_usbip()[:3]
+        wrapper = KERNEL_TOOLS_MSG in err
         return {
-            "usbip_installed": shutil.which(split_cmd(self.cfg["usbip_cmd"])[0]) is not None,
+            # True when usbip really runs ("usbip version"), not only when /usr/bin/usbip exists.
+            "usbip_installed": ok,
+            "usbip_path": " ".join(argv),
+            "usbip_error": None if ok else (err[:500] or "usbip does not run"),
+            # Also set when the agent works around a broken wrapper with the real binary.
+            "usbip_hint": kernel_tools_hint() if wrapper else
+            None if ok else "install usbip: re-run install.sh with --install-deps",
             "usbipd_running": self.usbipd_running(),
             "module_loaded": self.module_loaded(),
         }

@@ -286,7 +286,8 @@ class SetupPage(Page):
             self.banner.set_button_label(None)
             self.banner.set_revealed(True)
         elif s.get("online") and not usbip.get("usbip_installed", True):
-            self.banner.set_title("usbip is not installed on this setup. Re-run install.sh with --install-deps.")
+            self.banner.set_title("usbip does not work on this setup: "
+                                  + (usbip.get("usbip_hint") or "re-run install.sh with --install-deps") + ".")
             self.banner.set_button_label(None)
             self.banner.set_revealed(True)
         elif s.get("online") and not usbip.get("usbipd_running", True):
@@ -492,7 +493,8 @@ class SetupPage(Page):
                 for i in st.get("ips", [])] or [("Addresses", "none")]))
             u = st["usbip"]
             self.info_box.append(group("USB/IP", [
-                ("usbip installed", "yes" if u["usbip_installed"] else "NO"),
+                ("usbip installed", ("yes" if u["usbip_installed"] else "NO")
+                 + (f" ({u['usbip_hint']})" if u.get("usbip_hint") else "")),
                 ("usbipd running", "yes" if u["usbipd_running"] else "NO"),
                 ("usbip-host module", "loaded" if u["module_loaded"] else "not loaded"),
                 ("Devices", f"{st['usb_count']} ({st['usb_bound']} shared, {st['usb_in_use']} in use)"),

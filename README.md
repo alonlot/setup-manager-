@@ -605,7 +605,7 @@ fingerprint in **Edit setup**. To check a fingerprint: `setup-manager trust benc
 | Setup is offline | On the setup PC: `systemctl status setup-agent`. Check the firewall (8765/tcp). Check host and port in the app. |
 | "agent rejected the token" | The token in the app does not match `/etc/setup-agent/config.json`. |
 | "usbipd is not running" | Click **Start usbipd** in the banner, or `sudo systemctl restart setup-usbipd` on the setup PC. |
-| usbip not found on the setup PC | Ubuntu: `sudo apt install linux-tools-generic linux-tools-$(uname -r)`. Debian: `sudo apt install usbip`. |
+| usbip not found on the setup PC, or bind fails with "usbip not found for kernel ..." | Ubuntu: `/usr/bin/usbip` is a wrapper that needs the tools of the running kernel (after a kernel update too): `sudo apt install linux-tools-$(uname -r)`. Without them, the agent uses the newest `/usr/lib/linux-tools/*/usbip` that it finds; the status shows the path and the hint. Debian: `sudo apt install usbip`. |
 | Attach fails with "password is required" | Run `./install-app.sh` again (it adds the sudo rule). |
 | Attach fails with "open vhci_driver" | `sudo modprobe vhci-hcd` on your PC. |
 | Attach times out | Old agent: port 3240/tcp on the setup PC is blocked. Update the agent (USB/IP then goes through port 8765). |

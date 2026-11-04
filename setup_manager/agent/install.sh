@@ -42,18 +42,47 @@ if [[ $EUID -ne 0 ]]; then echo "run as root (sudo $0 ...)" >&2; exit 1; fi
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
 [[ "$RUN_AS" == "root" ]] && RUN_AS=""  # run_as "" means: as the agent itself (root)
 
-if [[ $DEPS -eq 1 ]] && ! command -v usbip >/dev/null; then
+# Ubuntu: /usr/bin/usbip(d) is a wrapper of linux-tools-common that fails ("usbip not found for
+# kernel ...") without linux-tools-$(uname -r). So check that usbip runs, not that it exists.
+usbip_works() { usbip version >/dev/null 2>&1; }
+# The real binary of any kernel version (the agent and setup-usbipd.service use it as a fallback).
+real_tool() {
+  local f
+  for f in "/usr/lib/linux-tools/$(uname -r)/$1" /usr/lib/linux-tools/*/"$1" /usr/lib/linux-tools-*/"$1"; do
+    [[ -x "$f" ]] && { echo "$f"; return 0; }
+  done
+  return 1
+}
+
+if [[ $DEPS -eq 1 ]] && ! usbip_works; then
   echo ">> installing usbip"
   if command -v apt-get >/dev/null; then
     if grep -qi ubuntu /etc/os-release; then
-      apt-get install -y "linux-tools-$(uname -r)" linux-tools-generic hwdata || apt-get install -y linux-tools-generic hwdata
+      KTOOLS="linux-tools-$(uname -r)"
+      if ! apt-get install -y "$KTOOLS" hwdata && ! { apt-get update -qq && apt-get install -y "$KTOOLS" hwdata; }; then
+        # Not in the archive (old or custom kernel): the tools of the kernel meta package.
+        REL="$(. /etc/os-release; echo "${VERSION_ID:-}")"
+        if dpkg-query -W -f='${Status}' "linux-generic-hwe-$REL" 2>/dev/null | grep -q "ok installed"; then
+          apt-get install -y "linux-tools-generic-hwe-$REL" hwdata || true
+        else
+          apt-get install -y linux-tools-generic hwdata || true
+        fi
+      fi
     else
-      apt-get install -y usbip hwdata
+      apt-get install -y usbip hwdata || true
     fi
-  elif command -v dnf >/dev/null; then dnf install -y usbip hwdata
-  elif command -v pacman >/dev/null; then pacman -S --noconfirm usbip hwdata
-  elif command -v zypper >/dev/null; then zypper install -y usbip
+  elif command -v dnf >/dev/null; then dnf install -y usbip hwdata || true
+  elif command -v pacman >/dev/null; then pacman -S --noconfirm usbip hwdata || true
+  elif command -v zypper >/dev/null; then zypper install -y usbip || true
   else echo "!! unknown package manager, install usbip yourself"; fi
+fi
+if ! usbip_works; then
+  if REAL="$(real_tool usbip)"; then
+    echo ">> 'usbip' does not run for kernel $(uname -r), the agent uses $REAL"
+    echo "   (to fix the command: sudo apt install linux-tools-$(uname -r))"
+  else
+    echo "!! usbip does not work for this kernel: sudo apt install linux-tools-$(uname -r)"
+  fi
 fi
 
 echo ">> installing agent to $PREFIX"
@@ -130,13 +159,14 @@ echo ">> installing systemd units"
 install -m 644 "$HERE/setup-agent.service" /etc/systemd/system/setup-agent.service
 install -m 644 "$HERE/setup-usbipd.service" /etc/systemd/system/setup-usbipd.service
 systemctl daemon-reload
-if command -v usbipd >/dev/null; then
+if usbipd --version >/dev/null 2>&1 || real_tool usbipd >/dev/null; then
   # Do not run two usbipd daemons when the distro unit is already active.
   if ! systemctl is-active --quiet usbipd.service 2>/dev/null; then
     systemctl enable --now setup-usbipd.service
   fi
 else
-  echo "!! usbipd not found. Install usbip (or use --install-deps), then: systemctl enable --now setup-usbipd"
+  echo "!! usbipd does not run for kernel $(uname -r). Install it (--install-deps, or Ubuntu:"
+  echo "   sudo apt install linux-tools-$(uname -r)), then: systemctl enable --now setup-usbipd"
 fi
 systemctl enable setup-agent.service
 systemctl restart setup-agent.service

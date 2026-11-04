@@ -41,8 +41,15 @@ if [[ $APT -eq 1 ]]; then
   echo ">> installing system packages (sudo)"
   pkgs=(python3-venv python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-vte-3.91 hwdata)
   if grep -qi ubuntu /etc/os-release; then
-    pkgs+=(linux-tools-generic)
-    apt-cache show "linux-tools-$(uname -r)" >/dev/null 2>&1 && pkgs+=("linux-tools-$(uname -r)")
+    # /usr/bin/usbip is a wrapper that needs the tools of the running kernel.
+    if apt-cache show "linux-tools-$(uname -r)" >/dev/null 2>&1; then
+      pkgs+=("linux-tools-$(uname -r)")
+    elif REL="$(. /etc/os-release; echo "${VERSION_ID:-}")" && \
+         dpkg-query -W -f='${Status}' "linux-generic-hwe-$REL" 2>/dev/null | grep -q "ok installed"; then
+      pkgs+=("linux-tools-generic-hwe-$REL")
+    else
+      pkgs+=(linux-tools-generic)
+    fi
   else
     pkgs+=(usbip)
   fi
@@ -85,18 +92,33 @@ sed "s|@EXEC@|$BIN/setup-manager|" "$HERE/setup_manager/app/data/$APP_ID.desktop
 command -v update-desktop-database >/dev/null && update-desktop-database "$DATA/applications" || true
 command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "$DATA/icons/hicolor" || true
 
+# Ubuntu: /usr/bin/usbip is a wrapper that fails ("usbip not found for kernel ...") without
+# linux-tools-$(uname -r); the app then runs the real binary in /usr/lib/linux-tools*/.
 USBIP="$(command -v usbip || true)"
+REAL=""
+for f in "/usr/lib/linux-tools/$(uname -r)/usbip" /usr/lib/linux-tools/*/usbip /usr/lib/linux-tools-*/usbip; do
+  if [[ -x "$f" ]]; then REAL="$f"; break; fi
+done
+if [[ -n "$USBIP" ]] && ! usbip version >/dev/null 2>&1; then
+  if [[ -n "$REAL" ]]; then
+    echo ">> 'usbip' does not run for kernel $(uname -r), the app uses $REAL"
+  else
+    echo "!! usbip does not work for this kernel: sudo apt install linux-tools-$(uname -r)"
+  fi
+fi
 MODPROBE="$(command -v modprobe || echo /usr/sbin/modprobe)"
-if [[ -n "$USBIP" ]]; then
+if [[ -n "$USBIP" || -n "$REAL" ]]; then
   echo ">> allowing '$ME' to run usbip and modprobe without a password (sudo)"
-  RULE="$ME ALL=(root) NOPASSWD: $USBIP, $MODPROBE vhci-hcd"
+  CMDS="/usr/lib/linux-tools/*/usbip, /usr/lib/linux-tools-*/usbip"
+  [[ -n "$USBIP" ]] && CMDS="$USBIP, $CMDS"
+  RULE="$ME ALL=(root) NOPASSWD: $CMDS, $MODPROBE vhci-hcd"
   echo "$RULE" | sudo tee /etc/sudoers.d/setup-manager >/dev/null
   sudo chmod 440 /etc/sudoers.d/setup-manager
   sudo visudo -cf /etc/sudoers.d/setup-manager >/dev/null || { sudo rm -f /etc/sudoers.d/setup-manager; echo "!! sudo rule rejected"; }
   echo vhci-hcd | sudo tee /etc/modules-load.d/setup-manager.conf >/dev/null
   sudo modprobe vhci-hcd || echo "!! could not load vhci-hcd now"
 else
-  echo "!! usbip not found. Attach will not work until you install it (Ubuntu: linux-tools-generic)."
+  echo "!! usbip not found. Attach will not work until you install it (Ubuntu: sudo apt install linux-tools-$(uname -r))."
 fi
 
 if getent group dialout >/dev/null && ! id -nG "$ME" | grep -qw dialout; then
