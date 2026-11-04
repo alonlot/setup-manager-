@@ -5,6 +5,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -41,7 +42,7 @@ def remote(tmp_path, agent, manager_config, monkeypatch):
     yield {"agents": agents, "first": agent, "second": second, "log": tmp_path / "ssh.log"}
     for a in agents.values():  # the agents that the fake install started
         try:
-            os.kill(int(open(a["pidfile"]).read()), 15)
+            os.kill(int(Path(a["pidfile"]).read_text()), 15)
         except (OSError, ValueError):
             pass
     stop_agent(second)

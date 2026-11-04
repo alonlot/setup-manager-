@@ -47,12 +47,15 @@ if m:
         sys.exit(100)
     a = agents[host]
     argv = shlex.split(m.group(3))
-    cfg = json.load(open(a["config"]))
+    with open(a["config"]) as fp:
+        cfg = json.load(fp)
     if "--token" in argv:
         cfg["token"] = argv[argv.index("--token") + 1]
-    json.dump(cfg, open(a["config"], "w"))
+    with open(a["config"], "w") as fp:
+        json.dump(cfg, fp)
     try:  # restart the agent, like systemctl restart setup-agent
-        old = int(open(a["pidfile"]).read())
+        with open(a["pidfile"]) as fp:
+            old = int(fp.read())
         os.kill(old, signal.SIGTERM)
         for _ in range(50):
             os.kill(old, 0)
@@ -62,7 +65,8 @@ if m:
     p = subprocess.Popen([sys.executable, a["script"], "--config", a["config"]], stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True,
                          env=dict(os.environ, FAKE_SYSFS=a["sysfs"]))
-    open(a["pidfile"], "w").write(str(p.pid))
+    with open(a["pidfile"], "w") as fp:
+        fp.write(str(p.pid))
     for _ in range(100):
         try:
             socket.create_connection(("127.0.0.1", cfg["port"]), timeout=0.2).close()
@@ -72,7 +76,8 @@ if m:
     cert = os.path.join(os.path.dirname(a["config"]), "cert.pem")
     print(">> installing agent to /opt/setup-agent")
     print("CONFIG_TOKEN=" + cfg["token"])
-    print("CONFIG_FINGERPRINT=" + hashlib.sha256(ssl.PEM_cert_to_DER_cert(open(cert).read())).hexdigest())
+    with open(cert) as fp:
+        print("CONFIG_FINGERPRINT=" + hashlib.sha256(ssl.PEM_cert_to_DER_cert(fp.read())).hexdigest())
     sys.exit(0)
 
 sys.exit(subprocess.run(["bash", "-c", cmd]).returncode)

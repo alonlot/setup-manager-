@@ -111,6 +111,10 @@ class AgentClient:
         else:
             der = w.get_extra_info("ssl_object").getpeercert(binary_form=True)
             w.close()
+            try:
+                await asyncio.wait_for(w.wait_closed(), 2)
+            except (OSError, asyncio.TimeoutError, _ssl.SSLError):
+                pass
             self.fingerprint = fingerprint_of(der)
             self.mode = "tls"
             if self.on_pin:
