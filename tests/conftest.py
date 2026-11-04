@@ -81,10 +81,46 @@ def sysfs(tmp_path):
     return build_sysfs(tmp_path / "sys")
 
 
-@pytest.fixture
-def agent(tmp_path, sysfs, monkeypatch):
+class FakeUsbipd:
+    """A TCP server in place of usbipd on the setup PC: answers OP_REQ_IMPORT and records the busids."""
+
+    def __init__(self):
+        import threading
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.imports = []
+        self.peers = []
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                conn, addr = self.sock.accept()
+            except OSError:
+                return
+            self.peers.append(addr[0])
+            data = b""
+            while len(data) < 40:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            if len(data) >= 40:
+                self.imports.append(data[8:40].split(b"\0", 1)[0].decode())
+                conn.sendall(b"\x01\x11\x00\x03\x00\x00\x00\x00IMPORTED")
+            conn.close()
+
+    def close(self):
+        self.sock.close()
+
+
+def start_agent(tmp_path, sysfs, **extra):
     port = free_port()
     dport = free_port(socket.SOCK_DGRAM)
+    usbipd = FakeUsbipd()
     cfg = {
         "name": "bench-test",
         "listen": "127.0.0.1",
@@ -97,7 +133,11 @@ def agent(tmp_path, sysfs, monkeypatch):
         "protected": ["2-1.3"],
         "auto_bind_interval": 1,
         "devfs_root": str(tmp_path / "dev"),
+        "files_dir": str(tmp_path / "files"),
+        "usbip_port": usbipd.port,
+        "usbip_network": "open",  # never change the firewall of the test PC
     }
+    cfg.update(extra)
     (tmp_path / "dev").mkdir(exist_ok=True)
     cfg_path = tmp_path / "agent.json"
     cfg_path.write_text(json.dumps(cfg))
@@ -113,13 +153,38 @@ def agent(tmp_path, sysfs, monkeypatch):
     else:
         proc.kill()
         raise RuntimeError(proc.stdout.read().decode())
-    yield {"port": port, "discovery_port": dport, "sysfs": sysfs, "config": cfg_path, "proc": proc,
-           "devfs": tmp_path / "dev"}
-    proc.terminate()
+    info = {"port": port, "discovery_port": dport, "sysfs": sysfs, "config": cfg_path, "proc": proc,
+            "devfs": tmp_path / "dev", "usbipd": usbipd, "tls": cfg.get("tls", "auto") is not False}
+    return info
+
+
+def stop_agent(info):
+    info["proc"].terminate()
     try:
-        proc.wait(5)
+        info["proc"].wait(5)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        info["proc"].kill()
+    info["usbipd"].close()
+
+
+@pytest.fixture
+def agent(tmp_path, sysfs, monkeypatch):
+    """An agent with TLS (the default) and the USB/IP tunnel."""
+    info = start_agent(tmp_path, sysfs)
+    yield info
+    stop_agent(info)
+
+
+def agent_url(info, path):
+    return f"{'https' if info['tls'] else 'http'}://127.0.0.1:{info['port']}{path}"
+
+
+def insecure_ctx():
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 @pytest.fixture
@@ -127,6 +192,7 @@ def manager_config(tmp_path, agent, monkeypatch):
     state = tmp_path / "usbip-state.json"
     monkeypatch.setenv("FAKE_SYSFS", str(agent["sysfs"]))
     monkeypatch.setenv("FAKE_USBIP_STATE", str(state))
+    monkeypatch.setenv("SETUP_MANAGER_STATE", str(tmp_path / "state"))
     cfg = {
         "local_usbip": {"command": [sys.executable, str(FAKES / "fake_usbip_client.py")], "sudo": False},
         "discovery_port": agent["discovery_port"],

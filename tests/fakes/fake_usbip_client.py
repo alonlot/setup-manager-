@@ -42,6 +42,21 @@ if args and args[0] == "attach":
     if not os.path.exists(st) or open(st).read().strip() != "1":
         print("usbip: error: Attach Request for %s failed - Device busy (exported)" % busid)
         sys.exit(1)
+    if tcp_port != "3240":
+        # An encrypted tunnel (or a direct usbipd): do the import request like the real usbip.
+        import socket
+        import struct
+        try:
+            c = socket.create_connection((host, int(tcp_port)), timeout=10)
+            c.sendall(struct.pack("!HHI32s", 0x0111, 0x8003, 0, busid.encode()))
+            reply = c.recv(64)
+        except OSError as e:
+            print("usbip: error: tcp connect: %s" % e)
+            sys.exit(1)
+        if not reply.startswith(b"\x01\x11\x00\x03"):
+            print("usbip: error: query: import reply failed")
+            sys.exit(1)
+        c.close()
     used = {p["port"] for p in ports}
     port = next(i for i in range(16) if i not in used)
     vid = open(os.path.join(root, "bus", "usb", "devices", busid, "idVendor")).read().strip()

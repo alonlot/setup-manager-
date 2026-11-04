@@ -8,5 +8,9 @@ rm -f /etc/systemd/system/setup-agent.service /etc/systemd/system/setup-usbipd.s
 rm -f /etc/modules-load.d/setup-agent.conf
 systemctl daemon-reload
 rm -rf /opt/setup-agent
+for t in iptables ip6tables; do  # the rule that blocks USB/IP from the network
+  command -v $t >/dev/null || continue
+  while $t -D INPUT -p tcp --dport 3240 ! -i lo -m comment --comment setup-agent-usbip -j DROP 2>/dev/null; do :; done
+done
 [[ "${1:-}" == "--purge" ]] && rm -rf /etc/setup-agent
 echo "setup-agent removed"

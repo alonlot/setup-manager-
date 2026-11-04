@@ -107,6 +107,8 @@ class OverviewPage(Page):
             row = Adw.ActionRow(title=s["name"], subtitle=sub, use_markup=False, activatable=True)
             row.set_subtitle_lines(2)
             row.add_prefix(dot(s.get("online")))
+            if s.get("online") and s.get("encrypted") is False:
+                row.add_suffix(pill("not encrypted", "red"))
             if s.get("online") and s.get("usbip") and not s["usbip"].get("usbipd_running"):
                 row.add_suffix(pill("usbipd off", "amber"))
             row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
@@ -272,6 +274,11 @@ class SetupPage(Page):
         usbip = s.get("usbip") or {}
         if s.get("online") is False:
             self.banner.set_title(f"Cannot reach the agent: {s.get('error') or ''}")
+            self.banner.set_button_label(None)
+            self.banner.set_revealed(True)
+        elif s.get("online") and s.get("encrypted") is False:
+            self.banner.set_title(f"NOT encrypted: TLS is off on this agent (older than 0.4, or installed with "
+                                  f"--plain). Fix: setup-manager deploy USER@{s['host']}")
             self.banner.set_button_label(None)
             self.banner.set_revealed(True)
         elif s.get("online") and not usbip.get("usbip_installed", True):

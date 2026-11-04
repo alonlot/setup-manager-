@@ -88,9 +88,12 @@ The installer:
 - Installs and starts two systemd services: `setup-agent` and `setup-usbipd`. They start at boot.
 - Loads `usbip-host` at boot.
 - Sets the shell user to the user that ran sudo (`run_as`). Shells and commands run as this user, not root.
-- Opens the ports in ufw when ufw is active (8765/tcp, 8765/udp, 3240/tcp).
+- Makes a TLS certificate for this PC and prints its fingerprint as `CONFIG_FINGERPRINT=...`.
+- Blocks USB/IP (port 3240) from the network: USB/IP goes through the encrypted agent port.
+- Opens the agent port in ufw when ufw is active (8765/tcp, 8765/udp).
 
-Options: `--token`, `--port`, `--run-as USER`, `--auto-bind RULE`, `--protect RULE`, `--tls`, `--install-deps`.
+Options: `--token`, `--port`, `--run-as USER`, `--auto-bind RULE`, `--protect RULE`, `--install-deps`,
+`--plain` (no TLS: NOT encrypted), `--open-usbip` (keep port 3240 open: USB/IP NOT encrypted).
 Run `install.sh` again to upgrade. It keeps the existing config. To remove: `sudo ./uninstall.sh [--purge]`.
 
 Check the agent on the setup PC: `systemctl status setup-agent` and `journalctl -u setup-agent -f`.
@@ -498,7 +501,7 @@ App (`~/.config/setup-manager/config.json`). You can change most values in the a
   "discovery_targets": ["255.255.255.255"],
   "setups": [
     { "id": "bench-1", "name": "bench-1", "host": "192.168.1.20", "port": 8765, "token": "...",
-      "tls": false, "verify_tls": false, "usbip_port": 3240, "notes": "STM32H7 board" }
+      "fingerprint": "9e09c394…", "transport": "auto", "usbip_port": 3240, "notes": "STM32H7 board" }
   ]
 }
 ```
@@ -509,12 +512,47 @@ Restart after a change: `sudo systemctl restart setup-agent`.
 
 ## Security
 
-Read this before you use it on a shared network.
+### How it connects
 
-- The agent gives a **root-level** API (USB control and shell) to everyone who has its token. Keep the token secret. Each agent can have its own token. The config file of the app has mode 600.
-- Without TLS, the token and the shell traffic go over the network as plain text. Use `--tls` on the agent (self-signed certificate) and turn on TLS for the setup in the app. Or use the agents only on a lab network that you trust.
-- USB/IP (port 3240) has no authentication and no encryption. This is a limit of USB/IP. Anyone who can reach port 3240 can attach a shared device. Share devices only on a trusted network, or limit port 3240 with a firewall to your PC's IP.
-- The MCP server can do everything the app can do. Give it only to agents that you trust with your lab.
+```
+ your PC (app, CLI, MCP, Lab)                         setup PC
+ TLS 1.2+ ──────────────────── TCP 8765 ────────────►  setup-agent
+   - API, shell, serial, files: every request has the token
+   - USB/IP: a tunnel in the same TLS port ("SMTUNNEL <token>"), relayed to usbipd on 127.0.0.1
+ UDP 8765 broadcast (Scan network only) ────────────►  name, port, version, fingerprint (no secrets)
+ SSH (setup-manager deploy only) ──── TCP 22 ───────►  install / update the agent
+                                                       port 3240 (usbipd): blocked from the network
+```
+
+Everything that goes over the network is encrypted: the token, the commands and their output,
+the shell, the serial data, the files, and the USB traffic.
+
+| Part | What protects it |
+|---|---|
+| Encryption | TLS 1.2 or newer on the agent port. The agent makes a self-signed certificate (EC P-256) at the installation. |
+| The agent's identity | The app pins the SHA-256 fingerprint of the certificate, like SSH `known_hosts`. A different certificate is refused ("the TLS certificate of ... changed! This can be an attack"). |
+| The first connection | `setup-manager deploy` reads the fingerprint over SSH, so the first connection is also safe. When you add a setup by hand, type the `CONFIG_FINGERPRINT` from `install.sh` in the fingerprint field, or the app trusts the certificate at the first connection. |
+| Access | A random token for each PC (32 bytes), unless you choose to use one token for all PCs. Without the token, only the name and version are visible. |
+| USB/IP | It goes only through the encrypted tunnel, which needs the token. The agent blocks port 3240 from the network with an iptables rule (`setup-agent-usbip`). Reservations also apply to the tunnel. |
+| Downgrade | A setup with a pinned fingerprint never uses plain HTTP. |
+| Files | The tokens are in files with mode 600 on both sides. The key of the certificate is mode 600. |
+
+**Old agents:** agents before version 0.4 have no TLS. The app still works with them, but shows
+"not encrypted" on the setup, and attaches USB/IP without encryption. Run `setup-manager deploy` for
+each setup PC to update it. Then turn on **Preferences > Require encryption**, so that the app refuses
+any connection that is not encrypted.
+
+**After you reinstall a setup PC** (new certificate): `setup-manager trust bench-1 --forget`, or clear the
+fingerprint in **Edit setup**. To check a fingerprint: `setup-manager trust bench-1`, and on the setup PC:
+`sudo openssl x509 -in /etc/setup-agent/cert.pem -outform der | sha256sum`.
+
+### What is still your job
+
+- The token gives root-level control of that setup PC (shell, commands as any user). Keep the tokens secret. The app config (`~/.config/setup-manager/config.json`) contains them.
+- All users of one token are the same user for the agent. The agent log does not show who did an action.
+- "In use by" names and reservations protect against mistakes, not against a person who has the token.
+- `setup-manager mcp --http` has no authentication. It listens on 127.0.0.1, so every user who can log in to your PC can use it. The stdio mode (the default) does not have this problem.
+- `--plain` and `--open-usbip` turn the encryption off. Use them only on a network that you trust completely.
 
 ## Troubleshooting
 
@@ -527,7 +565,9 @@ Read this before you use it on a shared network.
 | usbip not found on the setup PC | Ubuntu: `sudo apt install linux-tools-generic linux-tools-$(uname -r)`. Debian: `sudo apt install usbip`. |
 | Attach fails with "password is required" | Run `./install-app.sh` again (it adds the sudo rule). |
 | Attach fails with "open vhci_driver" | `sudo modprobe vhci-hcd` on your PC. |
-| Attach times out | Port 3240/tcp on the setup PC is blocked. |
+| Attach times out | Old agent: port 3240/tcp on the setup PC is blocked. Update the agent (USB/IP then goes through port 8765). |
+| "the TLS certificate of ... changed" | You reinstalled the agent: `setup-manager trust SETUP --forget`. If you did not, somebody can be between you and the PC: find out before you trust it. |
+| "does not use encryption" | The agent is older than 0.4 or was installed with `--plain`: `setup-manager deploy USER@HOST`. |
 | Scan network finds nothing | Discovery uses UDP broadcast and works only in one subnet. Add the setups by IP. |
 
 ## Development

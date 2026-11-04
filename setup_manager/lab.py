@@ -153,11 +153,10 @@ class _LabFleet(Fleet):
         super().__init__(store)
         self.leases: dict[str, dict[str, str]] = {}  # setup id -> {reservation key: lease}
 
-    def client(self, ref: str | dict[str, Any]) -> AgentClient:
-        setup = ref if isinstance(ref, dict) else self.setup(ref)
-        assert self.session is not None, "Fleet.open() was not called"
-        return _LeaseClient(self.session, setup, self.store.agent_port(setup), self.store.agent_token(setup),
-                            leases=list(self.leases.get(setup["id"], {}).values()))
+    client_class = _LeaseClient
+
+    def _client_kwargs(self, setup: dict[str, Any]) -> dict[str, Any]:
+        return {"leases": list(self.leases.get(setup["id"], {}).values())}
 
 
 class _MemoryStore(ConfigStore):

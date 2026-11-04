@@ -93,7 +93,7 @@ def build_server(store: ConfigStore | None = None) -> Any:
         async def go(f: Fleet) -> Any:
             await f.refresh_all()
             keep = ("id", "name", "host", "online", "error", "hostname", "os", "cpu_percent", "load", "usb_count",
-                    "usb_bound", "usb_in_use", "notes", "tags")
+                    "usb_bound", "usb_in_use", "notes", "tags", "encrypted")
             return [{k: s.get(k) for k in keep} for s in f.summaries()]
         return await _call(go)
 

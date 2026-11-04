@@ -51,8 +51,9 @@ def cmd_list(args: argparse.Namespace) -> None:
               "(or setup-manager deploy user@host)")
     for s in rows:
         state = "online " if s["online"] else "OFFLINE"
+        enc = "TLS  " if s.get("encrypted") else "PLAIN" if s.get("encrypted") is False else "?    "
         extra = f"usb={s.get('usb_count')} bound={s.get('usb_bound')}" if s["online"] else (s.get("error") or "")
-        print(f"{state}  {s['id']:<18} {s['host']:<20} {extra}")
+        print(f"{state}  {enc}  {s['id']:<18} {s['host']:<20} {extra}")
 
 
 def cmd_usb(args: argparse.Namespace) -> None:
@@ -215,6 +216,28 @@ def cmd_flash(args: argparse.Namespace) -> None:
     sys.exit(0 if r["ok"] else 1)
 
 
+def cmd_trust(args: argparse.Namespace) -> None:
+    f = Fleet(STORE)
+    if args.forget or args.fingerprint:
+        r = f.trust(args.setup, None if args.forget else args.fingerprint)
+        print(f"{r['setup']}: " + (f"trusts sha256 {r['fingerprint']}" if r["fingerprint"] else
+                                   "fingerprint removed: the next connection trusts the certificate it gets"))
+        return
+
+    async def go(fl: Fleet) -> Any:
+        c = fl.client(args.setup)
+        await c.ensure()
+        return {"encrypted": c.encrypted, "fingerprint": c.fingerprint, "pinned": fl.setup(args.setup)["fingerprint"]}
+    r = _run(go)
+    if args.json:
+        return _print(r, True)
+    print("encrypted (TLS)" if r["encrypted"] else "NOT encrypted (old agent: update it with setup-manager deploy)")
+    if r["fingerprint"]:
+        print(f"certificate sha256 {r['fingerprint']}")
+        print("On the setup PC, check it with: sudo openssl x509 -in /etc/setup-agent/cert.pem -outform der | "
+              "sha256sum")
+
+
 def cmd_rename(args: argparse.Namespace) -> None:
     r = _run(lambda f: f.set_nickname(args.setup, args.busid, " ".join(args.name)))
     print(r["message"])
@@ -222,7 +245,7 @@ def cmd_rename(args: argparse.Namespace) -> None:
 
 def cmd_add(args: argparse.Namespace) -> None:
     fields = {"name": args.name or args.host, "host": args.host, "port": args.port, "token": args.token or "",
-              "tls": args.tls}
+              "fingerprint": args.fingerprint or ""}
     r = _run(lambda f: f.add_setup(fields))
     state = "online" if r["online"] else f"offline ({r['error']})"
     print(f"added {r['setup']['id']}: {state}")
@@ -304,8 +327,10 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         install_args += ["--token", token]
     if args.install_deps:
         install_args.append("--install-deps")
-    if args.tls:
-        install_args.append("--tls")
+    if args.plain:
+        install_args.append("--plain")
+    if args.open_usbip:
+        install_args.append("--open-usbip")
     for rule in args.auto_bind or []:
         install_args += ["--auto-bind", rule]
     print(f">> copying agent to {target}")
@@ -328,12 +353,16 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         sys.exit(proc.returncode)
     output = b"".join(chunks).decode(errors="replace")
     agent_token = token
+    fingerprint = ""
     for line in output.splitlines():
         if line.startswith("CONFIG_TOKEN="):
             agent_token = line.split("=", 1)[1].strip()
+        if line.startswith("CONFIG_FINGERPRINT="):
+            fingerprint = line.split("=", 1)[1].strip()  # read over SSH: a safe first trust
     if not args.no_add:
         existing = STORE.get_setup(args.name or host)
-        fields = {"name": args.name or host, "host": host, "token": agent_token, "tls": args.tls}
+        fields = {"name": args.name or host, "host": host, "token": agent_token, "fingerprint": fingerprint,
+                  "transport": "tls" if fingerprint else "auto"}
         if existing:
             r = _run(lambda f: f.update_setup(existing["id"], fields))
         else:
@@ -456,6 +485,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--list-profiles", action="store_true")
     p.set_defaults(fn=cmd_flash)
 
+    p = sub.add_parser("trust", help="show or set the TLS certificate fingerprint of a setup")
+    p.add_argument("setup")
+    p.add_argument("--fingerprint", help="trust this SHA-256 fingerprint (from install.sh CONFIG_FINGERPRINT)")
+    p.add_argument("--forget", action="store_true", help="forget the fingerprint (after you reinstalled the agent)")
+    p.set_defaults(fn=cmd_trust)
+
     p = sub.add_parser("rename", help="give a device a nickname (no name = remove it)")
     p.add_argument("setup")
     p.add_argument("busid")
@@ -467,7 +502,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--name")
     p.add_argument("--port", type=int)
     p.add_argument("--token")
-    p.add_argument("--tls", action="store_true")
+    p.add_argument("--fingerprint", help="the TLS fingerprint from install.sh (else: trusted at the first use)")
     p.set_defaults(fn=cmd_add)
 
     p = sub.add_parser("remove", help="remove a setup")
@@ -484,7 +519,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--token", help="agent token (default: agent_defaults.token, or a new random one)")
     p.add_argument("--ssh-port", type=int)
     p.add_argument("--install-deps", action="store_true", help="install usbip with the package manager")
-    p.add_argument("--tls", action="store_true", help="enable TLS with a self-signed certificate")
+    p.add_argument("--plain", action="store_true", help="no TLS (NOT encrypted; TLS is the default)")
+    p.add_argument("--open-usbip", action="store_true", help="keep port 3240 open (USB/IP NOT encrypted)")
     p.add_argument("--auto-bind", action="append", help="auto-bind rule, e.g. 0483:374b (repeatable)")
     p.add_argument("--no-add", action="store_true", help="do not add the setup to the manager config")
     p.set_defaults(fn=cmd_deploy)

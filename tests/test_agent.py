@@ -2,18 +2,18 @@ import json
 import urllib.error
 import urllib.request
 
-from conftest import TOKEN
+from conftest import TOKEN, agent_url, insecure_ctx
 
 
 def call(agent, method, path, body=None, token=TOKEN):
-    req = urllib.request.Request(f"http://127.0.0.1:{agent['port']}{path}", method=method,
+    req = urllib.request.Request(agent_url(agent, path), method=method,
                                  data=json.dumps(body).encode() if body is not None else None)
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     if body is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=10, context=insecure_ctx()) as r:
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read())

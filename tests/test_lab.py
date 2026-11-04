@@ -125,10 +125,11 @@ def test_reservations(manager_config, agent, fake_mcus):
 def test_reservation_expires(lab, agent):
     import json
     import urllib.request
-    req = urllib.request.Request(f"http://127.0.0.1:{agent['port']}/api/reserve", method="POST",
+    from conftest import agent_url, insecure_ctx
+    req = urllib.request.Request(agent_url(agent, "/api/reserve"), method="POST",
                                  data=json.dumps({"busid": "1-1", "owner": "crashed-job", "ttl": 5}).encode(),
                                  headers={"Authorization": f"Bearer {TOKEN}"})
-    urllib.request.urlopen(req, timeout=5).read()
+    urllib.request.urlopen(req, timeout=5, context=insecure_ctx()).read()
     dev = lab.device("0483:374b")
     with pytest.raises(BoardBusy, match="crashed-job"):
         dev.reserve()

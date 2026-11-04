@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import os
+import ssl as _ssl
+import time
 from typing import Any
 
 import aiohttp
@@ -17,24 +20,102 @@ class AgentError(Exception):
         self.status = status
 
 
+def fingerprint_of(der: bytes) -> str:
+    return hashlib.sha256(der).hexdigest()
+
+
+def clean_fingerprint(fp: str | None) -> str:
+    """'AB:CD:..' or 'abcd..' -> 'abcd..' (64 hex characters), or '' when it is not a SHA-256 fingerprint."""
+    fp = (fp or "").replace(":", "").replace(" ", "").strip().lower()
+    return fp if len(fp) == 64 and all(c in "0123456789abcdef" for c in fp) else ""
+
+
+PLAIN_RECHECK = 120  # seconds: how often to check again if a plain-HTTP agent has TLS now
+
+
 class AgentClient:
-    def __init__(self, session: aiohttp.ClientSession, setup: dict[str, Any], port: int, token: str):
+    """One agent. The connection is TLS with a pinned certificate (fingerprint), like SSH:
+
+    * the setup has a fingerprint (from `deploy`, or saved at the first connection): TLS, and the
+      certificate must have this fingerprint, else the connection is refused;
+    * no fingerprint yet: the first connection reads the certificate and saves its fingerprint
+      (on_pin). An agent without TLS (an old agent) works without encryption, unless
+      require_tls is set or the setup has transport "tls".
+    """
+
+    def __init__(self, session: aiohttp.ClientSession, setup: dict[str, Any], port: int, token: str,
+                 transport_cache: dict[str, tuple[str, float]] | None = None, on_pin: Any = None,
+                 require_tls: bool = False):
         self.session = session
         self.setup = setup
         self.port = port
         self.token = token
+        self.on_pin = on_pin
+        self.cache = transport_cache if transport_cache is not None else {}
+        self.require_tls = require_tls
         host = setup["host"]
-        if ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        scheme = "https" if setup.get("tls") else "http"
-        self.base = f"{scheme}://{host}:{port}"
-        self.ws_base = f"{'wss' if setup.get('tls') else 'ws'}://{host}:{port}"
+        self._host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        self.fingerprint = clean_fingerprint(setup.get("fingerprint"))
+        transport = setup.get("transport") or ("tls" if setup.get("tls") else "auto")
+        self.transport = transport
+        self.mode: str | None = None
+        if self.fingerprint or transport == "tls" or setup.get("verify_tls"):
+            self.mode = "tls"
+        elif transport == "plain":
+            self.mode = "plain"
+        else:
+            hit = self.cache.get(setup.get("id", ""))
+            if hit and (hit[0] == "tls" or time.time() - hit[1] < PLAIN_RECHECK):
+                self.mode = hit[0]
+
+    @property
+    def encrypted(self) -> bool:
+        return self.mode == "tls"
+
+    @property
+    def base(self) -> str:
+        return f"{'https' if self.mode == 'tls' else 'http'}://{self._host}:{self.port}"
+
+    @property
+    def ws_base(self) -> str:
+        return f"{'wss' if self.mode == 'tls' else 'ws'}://{self._host}:{self.port}"
 
     @property
     def ssl(self) -> Any:
-        if self.setup.get("tls") and not self.setup.get("verify_tls"):
-            return False
-        return True
+        if self.mode != "tls":
+            return True  # not used for http:// URLs
+        if self.fingerprint:
+            return aiohttp.Fingerprint(bytes.fromhex(self.fingerprint))
+        if self.setup.get("verify_tls"):
+            return True  # a certificate from a real CA
+        return False
+
+    async def ensure(self) -> None:
+        """Find out if the agent uses TLS (and save its certificate) before the first request."""
+        if self.mode is None:
+            await self._probe()
+        if self.mode == "plain" and (self.require_tls or self.transport == "tls"):
+            raise AgentError(f"{self.setup['name']} does not use encryption (agent older than 0.4, or installed "
+                             f"with --plain). Fix: setup-manager deploy USER@{self.setup['host']}", 495)
+
+    async def _probe(self) -> None:
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        try:
+            _r, w = await asyncio.wait_for(asyncio.open_connection(self.setup["host"], self.port, ssl=ctx), 6)
+        except _ssl.SSLError:
+            self.mode = "plain"  # it answered, but not with TLS: an agent before version 0.4
+        except (OSError, asyncio.TimeoutError) as e:
+            raise AgentError(f"cannot reach {self.setup['name']} ({self.setup['host']}:{self.port}): {e}") from None
+        else:
+            der = w.get_extra_info("ssl_object").getpeercert(binary_form=True)
+            w.close()
+            self.fingerprint = fingerprint_of(der)
+            self.mode = "tls"
+            if self.on_pin:
+                self.on_pin(self.fingerprint)
+        self.cache[self.setup.get("id", "")] = (self.mode, time.time())
 
     @property
     def headers(self) -> dict[str, str]:
@@ -42,6 +123,7 @@ class AgentClient:
 
     async def request(self, method: str, path: str, body: dict | None = None,
                       params: dict | None = None, timeout: float = 10) -> Any:
+        await self.ensure()
         url = self.base + path
         try:
             async with self.session.request(method, url, json=body, params=params, headers=self.headers,
@@ -61,8 +143,15 @@ class AgentClient:
                 return data
         except asyncio.TimeoutError:
             raise AgentError(f"timeout talking to {self.setup['name']} ({self.base})") from None
+        except aiohttp.ServerFingerprintMismatch:
+            raise AgentError(self.mismatch_message(), 495) from None
         except aiohttp.ClientError as e:
             raise AgentError(f"cannot reach {self.setup['name']} ({self.base}): {e}") from None
+
+    def mismatch_message(self) -> str:
+        return (f"the TLS certificate of {self.setup['name']} changed! This can be an attack. If you reinstalled "
+                f"the agent on {self.setup['host']}, trust the new certificate: setup-manager trust "
+                f"{self.setup.get('id', self.setup['host'])} --forget (or Edit setup > clear the fingerprint)")
 
     async def ping(self) -> dict:
         return await self.request("GET", "/api/ping", timeout=4)
@@ -120,6 +209,7 @@ class AgentClient:
     # -- files, flash, claims, names ---------------------------------------------
     async def upload(self, local_path: str, remote_path: str) -> dict:
         size = os.path.getsize(local_path)
+        await self.ensure()
         try:
             with open(local_path, "rb") as f:
                 async with self.session.put(self.base + "/api/files", params={"path": remote_path}, data=f,
@@ -129,10 +219,13 @@ class AgentClient:
                     if r.status >= 400:
                         raise AgentError(data.get("error") or f"HTTP {r.status}", r.status)
                     return data
+        except aiohttp.ServerFingerprintMismatch:
+            raise AgentError(self.mismatch_message(), 495) from None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             raise AgentError(f"upload to {self.setup['name']} failed: {e}") from None
 
     async def download(self, remote_path: str, local_path: str) -> dict:
+        await self.ensure()
         try:
             async with self.session.get(self.base + "/api/files", params={"path": remote_path},
                                         headers=self.headers, ssl=self.ssl,
@@ -146,6 +239,8 @@ class AgentClient:
                         f.write(chunk)
                         size += len(chunk)
                 return {"path": local_path, "size": size}
+        except aiohttp.ServerFingerprintMismatch:
+            raise AgentError(self.mismatch_message(), 495) from None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             raise AgentError(f"download from {self.setup['name']} failed: {e}") from None
 

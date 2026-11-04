@@ -61,7 +61,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEFAULT_CONFIG_PATH = "/etc/setup-agent/config.json"
 DISCOVERY_MAGIC = b"SETUP-MANAGER-DISCOVER"
 BUSID_RE = re.compile(r"^\d+-\d+(\.\d+)*$")
@@ -76,8 +76,17 @@ DEFAULTS = {
     "port": 8765,
     "token": "",
     "insecure_no_auth": False,
+    # TLS: "auto" (default) = on, with the given tls_cert/tls_key or a self-signed certificate
+    # that the agent makes at the first start in tls_dir (default: the folder of the config).
+    # false = plain HTTP (not encrypted, only for tests or old managers).
+    "tls": "auto",
     "tls_cert": "",
     "tls_key": "",
+    "tls_dir": "",
+    # USB/IP: "tunnel" (default with TLS) = port 3240 is blocked from the network, USB/IP works only
+    # through the encrypted tunnel on the agent port. "open" = port 3240 stays open (not encrypted).
+    "usbip_network": "tunnel",
+    "usbip_port": 3240,
     # User for shells and commands. Empty = the user the agent runs as (root).
     "run_as": "",
     "shell": "/bin/bash",
@@ -1371,6 +1380,254 @@ def chown_to(user, path):
         pass
 
 
+# --------------------------------------------------------------------------- TLS front end and USB/IP tunnel
+#
+# With TLS on (the default), the HTTP server listens on 127.0.0.1 only. A TLS
+# front end listens on the network port. For each connection it does the TLS
+# handshake and then relays the bytes, in ONE thread per connection (OpenSSL
+# does not allow one TLS connection to be used from two threads at the same time).
+# A connection that starts with "SMTUNNEL <token> [leases]\n" is a USB/IP tunnel:
+# it is relayed to the local usbipd, so USB/IP is encrypted and needs the token.
+
+REAL_ADDR = {}  # local port of the relay's connection to the HTTP server -> real client address
+TUNNEL_MAGIC = b"SMTUNNEL "
+OP_REQ_IMPORT = 0x8003
+
+
+def cert_fingerprint(cert_path):
+    """SHA-256 of the certificate (DER), as lowercase hex. The manager pins this value."""
+    with open(cert_path) as f:
+        der = ssl.PEM_cert_to_DER_cert(f.read())
+    return hashlib.sha256(der).hexdigest()
+
+
+def ensure_cert(cfg, config_path):
+    """Return (cert, key): the configured files, or a self-signed pair made with openssl at the first start."""
+    if cfg.get("tls_cert") and cfg.get("tls_key"):
+        return cfg["tls_cert"], cfg["tls_key"]
+    folder = cfg.get("tls_dir") or (os.path.dirname(os.path.abspath(config_path)) if config_path else
+                                    "/etc/setup-agent")
+    cert, key = os.path.join(folder, "cert.pem"), os.path.join(folder, "key.pem")
+    if os.path.exists(cert) and os.path.exists(key):
+        return cert, key
+    if not shutil.which("openssl"):
+        raise ApiError(500, "openssl is not installed: cannot make a TLS certificate")
+    os.makedirs(folder, exist_ok=True)
+    cmd = ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+           "-days", "3650", "-subj", "/CN=%s" % socket.gethostname(), "-keyout", key, "-out", cert]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if p.returncode != 0:
+        raise ApiError(500, "openssl failed: %s" % p.stdout.decode(errors="replace")[-300:])
+    os.chmod(key, 0o600)
+    log.info("made a TLS certificate %s (sha256 %s)", cert, cert_fingerprint(cert))
+    return cert, key
+
+
+def relay(a, b, first_to_b=b"", idle=None):
+    """Copy bytes both ways between socket a (TLS or plain) and socket b, in this thread only."""
+    a.setblocking(False)
+    b.setblocking(False)
+    to_b, to_a = bytearray(first_to_b), bytearray()
+    a_eof = b_eof = False
+    limit = 4 * 1024 * 1024
+    last = time.time()
+    while True:
+        if (a_eof and not to_b) or (b_eof and not to_a):
+            break
+        rl = ([a] if not a_eof and len(to_b) < limit else []) + ([b] if not b_eof and len(to_a) < limit else [])
+        wl = ([b] if to_b else []) + ([a] if to_a else [])
+        pending = isinstance(a, ssl.SSLSocket) and not a_eof and a.pending() > 0
+        try:
+            r, w, _ = select.select(rl, wl, [], 0 if pending else 30)
+        except (OSError, ValueError):
+            break
+        if not r and not w and not pending:
+            if idle and time.time() - last > idle:
+                break
+            continue
+        last = time.time()
+        if (a in r or pending) and not a_eof:
+            try:
+                data = a.recv(65536)
+                if data:
+                    to_b += data
+                else:
+                    a_eof = True
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                pass
+            except (OSError, ssl.SSLError):
+                a_eof = True
+        if b in r and not b_eof:
+            try:
+                data = b.recv(65536)
+                if data:
+                    to_a += data
+                else:
+                    b_eof = True
+            except BlockingIOError:
+                pass
+            except OSError:
+                b_eof = True
+        try:
+            if b in w and to_b:
+                del to_b[:b.send(to_b)]
+        except BlockingIOError:
+            pass
+        except OSError:
+            break
+        try:
+            if a in w and to_a:
+                del to_a[:a.send(to_a)]
+        except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+            pass
+        except (OSError, ssl.SSLError):
+            break
+    for s in (a, b):
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+class TlsFront:
+    def __init__(self, agent, listen, port, cert, key, http_port):
+        self.agent = agent
+        self.http_port = http_port
+        self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        self.ctx.load_cert_chain(cert, key)
+        family = socket.AF_INET6 if ":" in listen else socket.AF_INET
+        self.sock = socket.socket(family, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((listen, int(port)))
+        self.sock.listen(64)
+
+    def serve(self):
+        while True:
+            try:
+                conn, addr = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn, addr), name="tls", daemon=True).start()
+
+    def _handle(self, conn, addr):
+        try:
+            conn.settimeout(10)
+            tls = self.ctx.wrap_socket(conn, server_side=True)
+            first = tls.recv(65536)  # the client speaks first (HTTP, WebSocket, tunnel)
+        except (OSError, ssl.SSLError, ValueError) as e:
+            log.debug("TLS handshake with %s failed: %s", addr[0], e)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
+        if first.startswith(TUNNEL_MAGIC):
+            return self._tunnel(tls, addr, first)
+        try:
+            back = socket.create_connection(("127.0.0.1", self.http_port), timeout=10)
+        except OSError:
+            tls.close()
+            return
+        local_port = back.getsockname()[1]
+        REAL_ADDR[local_port] = addr
+        try:
+            relay(tls, back, first)
+        finally:
+            REAL_ADDR.pop(local_port, None)
+
+    def _tunnel(self, tls, addr, first):
+        try:
+            tls.settimeout(30)
+            self._tunnel_inner(tls, addr, first)
+        except (OSError, ssl.SSLError, ValueError, struct.error) as e:
+            log.debug("USB/IP tunnel from %s ended: %s", addr[0], e)
+            try:
+                tls.close()
+            except OSError:
+                pass
+
+    def _tunnel_inner(self, tls, addr, first):
+        """USB/IP over TLS: check the token (and the reservation of the device), then relay to usbipd."""
+        a = self.agent
+        line, sep, rest = first.partition(b"\n")
+        while not sep and len(line) < 4096:
+            more = tls.recv(4096)
+            if not more:
+                tls.close()
+                return
+            line, sep, rest = (line + more).partition(b"\n")
+        parts = line.decode(errors="replace").split()
+        token = parts[1] if len(parts) > 1 else ""
+        leases = parts[2].split(",") if len(parts) > 2 else []
+        ok = a.cfg.get("insecure_no_auth") or (a.cfg.get("token") and hmac.compare_digest(
+            token.encode(), str(a.cfg["token"]).encode()))
+        if not ok:
+            log.warning("USB/IP tunnel from %s: wrong token", addr[0])
+            tls.sendall(b"ERR unauthorized\n")
+            tls.close()
+            return
+        # The first USB/IP request: for an import, check the reservation of the device.
+        while len(rest) < 8:
+            more = tls.recv(4096)
+            if not more:
+                tls.close()
+                return
+            rest += more
+        busid = None
+        if struct.unpack("!HH", rest[:4])[1] == OP_REQ_IMPORT:
+            while len(rest) < 40:
+                more = tls.recv(4096)
+                if not more:
+                    tls.close()
+                    return
+                rest += more
+            busid = rest[8:40].split(b"\0", 1)[0].decode(errors="replace")
+            try:
+                a.check_lease(busid, leases)
+            except ApiError as e:
+                log.warning("USB/IP tunnel from %s refused: %s", addr[0], e.message)
+                tls.sendall(b"ERR " + e.message.encode()[:300] + b"\n")
+                tls.close()
+                return
+        try:
+            back = socket.create_connection(("127.0.0.1", int(a.cfg.get("usbip_port") or 3240)), timeout=10)
+        except OSError as e:
+            tls.sendall(("ERR usbipd is not reachable: %s\n" % e).encode())
+            tls.close()
+            return
+        tls.sendall(b"OK\n")
+        tid = id(back)
+        a.tunnels[tid] = {"ip": addr[0], "busid": busid, "at": time.time()}
+        log.info("USB/IP tunnel from %s%s", addr[0], " for %s" % busid if busid else "")
+        try:
+            relay(tls, back, rest)
+        finally:
+            a.tunnels.pop(tid, None)
+
+
+FW_COMMENT = "setup-agent-usbip"
+
+
+def usbip_firewall(block, port=3240):
+    """Block (or unblock) USB/IP from the network, so that it works only through the encrypted tunnel."""
+    done = []
+    for tool in ("iptables", "ip6tables"):
+        if not shutil.which(tool):
+            continue
+        rule = ["INPUT", "-p", "tcp", "--dport", str(port), "!", "-i", "lo", "-m", "comment", "--comment",
+                FW_COMMENT, "-j", "DROP"]
+        exists = subprocess.run([tool, "-C"] + rule, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if block and exists.returncode != 0:
+            p = subprocess.run([tool, "-I"] + rule, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            done.append("%s: %s" % (tool, "blocked" if p.returncode == 0 else p.stdout.decode(errors="replace")))
+        elif not block:
+            while subprocess.run([tool, "-D"] + rule, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL).returncode == 0:
+                done.append("%s: unblocked" % tool)
+    return done
+
+
 class WebSocket:
     """Minimal RFC 6455 server-side WebSocket on top of a BaseHTTPRequestHandler connection."""
 
@@ -1593,11 +1850,15 @@ class Agent:
         self.hub = SerialHub(float(cfg.get("serial_idle_timeout") or 900))
         self.claims = {}
         self.reservations = {}
+        self.tunnels = {}
+        self.tls_fingerprint = None
         self.res_lock = threading.Lock()
 
     # -- API handlers ----------------------------------------------------------
     def ping(self):
         return {"service": "setup-agent", "name": self.cfg["name"], "hostname": socket.gethostname(),
+                "tls": bool(self.tls_fingerprint), "tunnel": bool(self.tls_fingerprint),
+                "fingerprint": self.tls_fingerprint,
                 "version": VERSION}
 
     def status(self):
@@ -1630,6 +1891,9 @@ class Agent:
             "usb_in_use": sum(1 for d in devices if d["state"] == "in_use"),
             "run_as": self.cfg.get("run_as") or current_user(),
             "agent_user": current_user(),
+            "tls": bool(self.tls_fingerprint),
+            "tunnel": bool(self.tls_fingerprint),
+            "fingerprint": self.tls_fingerprint,
             "time": time.time(),
         }
 
@@ -1648,13 +1912,18 @@ class Agent:
             self.claims.pop(busid, None)  # detached: forget the claim (after a grace time for a slow attach)
         if not in_use:
             return
-        ips = usbip_client_ips()
+        ips = usbip_client_ips() - {"127.0.0.1", "::1"}  # loopback = our own tunnel relay
+        ips |= {t["ip"] for t in self.tunnels.values()}
         claimed_ips = {c["ip"] for c in self.claims.values()}
         others = sorted(ips - claimed_ips)
+        by_tunnel = dict((t["busid"], t) for t in self.tunnels.values() if t.get("busid"))
         for d in in_use:
             c = self.claims.get(d["busid"])
+            t = by_tunnel.get(d["busid"])
             if c:
                 d["used_by"] = dict(c, source="claim", connected=c["ip"] in ips if ips else None)
+            elif t:
+                d["used_by"] = {"ip": t["ip"], "host": reverse_name(t["ip"]), "source": "tunnel"}
             elif len(others) == 1:
                 d["used_by"] = {"ip": others[0], "host": reverse_name(others[0]), "source": "tcp"}
             elif others:
@@ -2015,7 +2284,7 @@ class Agent:
                 if data.strip() != DISCOVERY_MAGIC:
                     continue
                 reply = dict(self.ping())
-                reply.update({"port": int(self.cfg["port"]), "tls": bool(self.cfg.get("tls_cert"))})
+                reply.update({"port": int(self.cfg["port"])})
                 s.sendto(json.dumps(reply).encode(), addr)
             except OSError as e:  # pragma: no cover
                 log.warning("discovery error: %s", e)
@@ -2035,6 +2304,14 @@ class Handler(BaseHTTPRequestHandler):
     @property
     def agent(self):
         return self.server.agent
+
+    def real_ip(self):
+        """The client address (behind the TLS front end, the address of the real client)."""
+        if self.client_address[0] in ("127.0.0.1", "::1"):
+            real = REAL_ADDR.get(self.client_address[1])
+            if real:
+                return real[0]
+        return self.client_address[0]
 
     def log_message(self, fmt, *args):
         log.debug("%s %s", self.address_string(), fmt % args)
@@ -2148,7 +2425,7 @@ class Handler(BaseHTTPRequestHandler):
                 ("POST", "/api/usb/reset"): lambda: a.usb.reset(body.get("busid")),
                 ("POST", "/api/usb/identify"): lambda: a.identify(body),
                 ("POST", "/api/usb/flash"): lambda: a.flash(body),
-                ("POST", "/api/usb/claim"): lambda: a.claim(body, self.client_address[0]),
+                ("POST", "/api/usb/claim"): lambda: a.claim(body, self.real_ip()),
                 ("POST", "/api/usb/release"): lambda: a.release(body),
                 ("POST", "/api/usb/nickname"): lambda: a.set_nickname(body),
                 ("GET", "/api/serial"): lambda: {"sessions": a.hub.list()},
@@ -2282,11 +2559,25 @@ def main(argv=None):
         log.warning("not running as root: USB bind/unbind and user switching will not work")
 
     agent = Agent(cfg, args.config if os.path.exists(args.config) else None)
-    server = Server((cfg["listen"], int(cfg["port"])), agent)
-    if cfg.get("tls_cert") and cfg.get("tls_key"):
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(cfg["tls_cert"], cfg["tls_key"])
-        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    use_tls = str(cfg.get("tls", "auto")).lower() not in ("false", "0", "no", "off")
+    front = None
+    if use_tls:
+        try:
+            cert, key = ensure_cert(cfg, args.config)
+        except (ApiError, OSError) as e:
+            log.error("cannot start TLS: %s", getattr(e, "message", e))
+            return 3
+        server = Server(("127.0.0.1", 0), agent)  # only the TLS front end can reach it
+        front = TlsFront(agent, cfg["listen"], cfg["port"], cert, key, server.server_address[1])
+        agent.tls_fingerprint = cert_fingerprint(cert)
+        threading.Thread(target=front.serve, name="tls-front", daemon=True).start()
+    else:
+        server = Server((cfg["listen"], int(cfg["port"])), agent)
+        log.warning("TLS is off: the API and the shell are not encrypted")
+    if os.geteuid() == 0:
+        block = bool(use_tls) and cfg.get("usbip_network", "tunnel") == "tunnel"
+        for note in usbip_firewall(block, int(cfg.get("usbip_port") or 3240)):
+            log.info("USB/IP port: %s", note)
 
     if os.geteuid() == 0:
         threading.Thread(target=agent.usb.ensure_usbipd, name="usbipd-init", daemon=True).start()
@@ -2301,7 +2592,7 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     log.info("setup-agent %s '%s' listening on %s:%s%s", VERSION, cfg["name"], cfg["listen"], cfg["port"],
-             " (TLS)" if cfg.get("tls_cert") else "")
+             " (TLS, sha256 %s)" % agent.tls_fingerprint if front else " (NOT encrypted)")
     server.serve_forever()
     return 0
 

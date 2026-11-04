@@ -2,7 +2,13 @@
 # Install (or upgrade) the Setup Manager agent on this Setup PC.
 #
 #   sudo ./install.sh [--name NAME] [--token TOKEN] [--port 8765] [--run-as USER]
-#                     [--auto-bind RULE]... [--protect RULE]... [--tls] [--install-deps]
+#                     [--auto-bind RULE]... [--protect RULE]... [--install-deps]
+#                     [--plain] [--open-usbip]
+#
+# TLS is on by default: a self-signed certificate is made in /etc/setup-agent, and its
+# fingerprint is printed (CONFIG_FINGERPRINT=...). USB/IP goes through the encrypted
+# agent port, and port 3240 is blocked from the network. --plain turns TLS off (not
+# encrypted). --open-usbip keeps port 3240 open (USB/IP not encrypted).
 #
 # An existing /etc/setup-agent/config.json is kept. Options given on the
 # command line replace the values in it.
@@ -13,7 +19,7 @@ PREFIX=/opt/setup-agent
 CONF_DIR=/etc/setup-agent
 CONF="$CONF_DIR/config.json"
 
-NAME="" TOKEN="" PORT="" RUN_AS="${SUDO_USER:-}" TLS=0 DEPS=0
+NAME="" TOKEN="" PORT="" RUN_AS="${SUDO_USER:-}" TLS=1 DEPS=0 OPEN_USBIP=0
 AUTO_BIND=() PROTECT=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -24,8 +30,10 @@ while [[ $# -gt 0 ]]; do
     --auto-bind) AUTO_BIND+=("$2"); shift 2;;
     --protect) PROTECT+=("$2"); shift 2;;
     --tls) TLS=1; shift;;
+    --plain) TLS=0; shift;;
+    --open-usbip) OPEN_USBIP=1; shift;;
     --install-deps) DEPS=1; shift;;
-    -h|--help) sed -n '2,9p' "$0"; exit 0;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; exit 1;;
   esac
 done
@@ -58,8 +66,9 @@ printf 'usbip-core\nusbip-host\n' > /etc/modules-load.d/setup-agent.conf
 modprobe usbip-host 2>/dev/null || echo "!! could not load usbip-host now (is usbip installed for this kernel?)"
 
 if [[ $TLS -eq 1 && ! -f "$CONF_DIR/cert.pem" ]]; then
+  command -v openssl >/dev/null || { echo "openssl is required for TLS (or use --plain)" >&2; exit 1; }
   echo ">> creating a self-signed TLS certificate"
-  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=$(hostname)" \
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 -subj "/CN=$(hostname)" \
     -keyout "$CONF_DIR/key.pem" -out "$CONF_DIR/cert.pem" 2>/dev/null
   chmod 600 "$CONF_DIR/key.pem"
 fi
@@ -67,6 +76,7 @@ fi
 AUTO_JSON="$(printf '%s\n' "${AUTO_BIND[@]+"${AUTO_BIND[@]}"}")" \
 PROTECT_JSON="$(printf '%s\n' "${PROTECT[@]+"${PROTECT[@]}"}")" \
 NAME="$NAME" TOKEN="$TOKEN" PORT="$PORT" RUN_AS="$RUN_AS" TLS="$TLS" CONF="$CONF" CONF_DIR="$CONF_DIR" \
+OPEN_USBIP="$OPEN_USBIP" \
 python3 - <<'PY'
 import json, os, secrets, socket
 conf = os.environ["CONF"]
@@ -88,8 +98,13 @@ prot = [x for x in env["PROTECT_JSON"].splitlines() if x.strip()]
 cfg["auto_bind"] = sorted(set(cfg.get("auto_bind", [])) | set(auto))
 cfg["protected"] = sorted(set(cfg.get("protected", [])) | set(prot))
 if env["TLS"] == "1":
-    cfg["tls_cert"] = os.path.join(env["CONF_DIR"], "cert.pem")
-    cfg["tls_key"] = os.path.join(env["CONF_DIR"], "key.pem")
+    cfg["tls"] = "auto"
+    if not os.path.exists(cfg.get("tls_cert") or ""):
+        cfg["tls_cert"] = os.path.join(env["CONF_DIR"], "cert.pem")
+        cfg["tls_key"] = os.path.join(env["CONF_DIR"], "key.pem")
+else:
+    cfg["tls"] = False
+cfg["usbip_network"] = "open" if env["OPEN_USBIP"] == "1" or env["TLS"] != "1" else "tunnel"
 tmp = conf + ".tmp"
 with open(tmp, "w") as f:
     json.dump(cfg, f, indent=2)
@@ -98,6 +113,10 @@ os.replace(tmp, conf)
 print("CONFIG_NAME=" + cfg["name"])
 print("CONFIG_PORT=%d" % cfg["port"])
 print("CONFIG_TOKEN=" + cfg["token"])
+if cfg.get("tls") is not False:
+    import hashlib, ssl
+    with open(cfg["tls_cert"]) as f:
+        print("CONFIG_FINGERPRINT=" + hashlib.sha256(ssl.PEM_cert_to_DER_cert(f.read())).hexdigest())
 PY
 
 if [[ -n "$RUN_AS" ]] && getent group dialout >/dev/null; then
@@ -122,11 +141,18 @@ systemctl restart setup-agent.service
 
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
   PORT_NOW="$(python3 -c "import json;print(json.load(open('$CONF')).get('port',8765))")"
-  ufw allow "$PORT_NOW/tcp" >/dev/null; ufw allow "$PORT_NOW/udp" >/dev/null; ufw allow 3240/tcp >/dev/null
-  echo ">> opened ufw ports $PORT_NOW/tcp, $PORT_NOW/udp, 3240/tcp"
+  ufw allow "$PORT_NOW/tcp" >/dev/null; ufw allow "$PORT_NOW/udp" >/dev/null
+  if [[ $OPEN_USBIP -eq 1 || $TLS -eq 0 ]]; then
+    ufw allow 3240/tcp >/dev/null
+    echo ">> opened ufw ports $PORT_NOW/tcp, $PORT_NOW/udp, 3240/tcp (USB/IP NOT encrypted)"
+  else
+    ufw delete allow 3240/tcp >/dev/null 2>&1 || true
+    echo ">> opened ufw ports $PORT_NOW/tcp, $PORT_NOW/udp (USB/IP goes through the encrypted agent port)"
+  fi
 fi
 
 sleep 1
 systemctl --no-pager --lines=0 status setup-agent.service || true
 echo
-echo "Agent installed. Add this PC to the manager with the host/IP of this PC, and the token above (CONFIG_TOKEN)."
+echo "Agent installed. Add this PC to the manager with the host/IP of this PC, the token (CONFIG_TOKEN)"
+echo "and the TLS fingerprint (CONFIG_FINGERPRINT) above."

@@ -16,7 +16,8 @@ from typing import Any
 import aiohttp
 
 from . import flash_profiles, mcu_detect
-from .agent_client import AgentClient, AgentError
+from . import tunnel
+from .agent_client import AgentClient, AgentError, clean_fingerprint
 from .config import ConfigError, ConfigStore
 from .usbip_local import LocalUsbip, UsbipError
 
@@ -78,6 +79,8 @@ class Fleet:
         self._local_hub: Any = None
         self._local_usb: Any = None
         self.serial_targets: dict[str, dict[str, Any]] = {}
+        self._transport: dict[str, tuple[str, float]] = {}  # setup id -> ("tls" | "plain", checked at)
+        self._tunnel_procs: dict[int, Any] = {}
 
     # -- lifecycle -------------------------------------------------------------
     async def open(self) -> "Fleet":
@@ -117,10 +120,44 @@ class Fleet:
             raise FleetError(f"unknown setup '{ref}' (known: {names})", 404)
         return s
 
+    client_class = AgentClient
+
+    def _client_kwargs(self, setup: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
     def client(self, ref: str | dict[str, Any]) -> AgentClient:
         setup = ref if isinstance(ref, dict) else self.setup(ref)
         assert self.session is not None, "Fleet.open() was not called"
-        return AgentClient(self.session, setup, self.store.agent_port(setup), self.store.agent_token(setup))
+        return self.client_class(self.session, setup, self.store.agent_port(setup), self.store.agent_token(setup),
+                                 transport_cache=self._transport,
+                                 on_pin=lambda fp, sid=setup["id"]: self._pin(sid, fp),
+                                 require_tls=bool(self.store.data().get("require_encryption")),
+                                 **self._client_kwargs(setup))
+
+    def _pin(self, sid: str, fp: str) -> None:
+        """Trust on first use: save the fingerprint of the agent's certificate (like SSH known_hosts)."""
+        try:
+            self.store.update_setup(sid, {"fingerprint": fp})
+            log.warning("first TLS connection to %s: trusting its certificate sha256 %s", sid, fp)
+        except ConfigError:
+            pass
+
+    def trust(self, ref: str, fingerprint: str | None) -> dict[str, Any]:
+        """Set the pinned fingerprint of a setup ('' = forget it: the next connection trusts the new one)."""
+        setup = self.setup(ref)
+        fp = clean_fingerprint(fingerprint) if fingerprint else ""
+        if fingerprint and not fp:
+            raise FleetError("a fingerprint is 64 hex characters (SHA-256), with or without ':'")
+        self.store.update_setup(setup["id"], {"fingerprint": fp})
+        self._transport.pop(setup["id"], None)
+        return {"setup": setup["id"], "fingerprint": fp}
+
+    def encryption(self, ref: str) -> dict[str, Any]:
+        setup = self.setup(ref)
+        hit = self._transport.get(setup["id"])
+        fp = clean_fingerprint(setup.get("fingerprint"))
+        enc = True if fp else (hit[0] == "tls" if hit else None)
+        return {"encrypted": enc, "fingerprint": fp, "transport": setup.get("transport", "auto")}
 
     def _lock(self, key: str) -> asyncio.Lock:
         if key not in self._locks:
@@ -192,6 +229,7 @@ class Fleet:
                 "usb_bound": st.get("usb_bound"),
                 "usb_in_use": st.get("usb_in_use"),
                 "usbip": st.get("usbip"),
+                **self.encryption(s["id"]),
             })
         return out
 
@@ -208,19 +246,37 @@ class Fleet:
         ports = await self.local.ports()
         setups = self.store.setups()
         keys = await asyncio.gather(*(self._host_keys(s["host"]) for s in setups))
+        tunnels = tunnel.load_tunnels()
+        live = set()
         for p in ports:
             p["setup"] = None
+            t = tunnels.get(str(p.get("remote_port"))) if p.get("host") in ("127.0.0.1", "localhost", "::1") else None
+            if t and t.get("busid") == p.get("busid") and any(s["id"] == t["setup"] for s in setups):
+                s = next(x for x in setups if x["id"] == t["setup"])
+                p.update({"setup": s["id"], "setup_name": s["name"], "encrypted": True})
+                live.add(str(p["remote_port"]))
+                for d in self.cache.get(s["id"], {}).get("usb") or []:
+                    if d["busid"] == p.get("busid"):
+                        p["name"] = d["name"]
+                        p["serial"] = d.get("serial")
+                continue
             host = (p.get("host") or "").lower()
             for s, k in zip(setups, keys):
                 if host in k and (p.get("remote_port") or 3240) == s.get("usbip_port", 3240):
                     p["setup"] = s["id"]
                     p["setup_name"] = s["name"]
+                    p["encrypted"] = False
                     # `usbip port` often has no names (no usb.ids): use the agent's name.
                     for d in self.cache.get(s["id"], {}).get("usb") or []:
                         if d["busid"] == p.get("busid"):
                             p["name"] = d["name"]
                             p["serial"] = d.get("serial")
                     break
+        stale = [k for k, t in tunnels.items() if k not in live and time.time() - t.get("at", 0) > 60]
+        if stale:
+            for k in stale:
+                tunnels.pop(k, None)
+            tunnel.save_tunnels(tunnels)
         return ports
 
     @staticmethod
@@ -302,10 +358,7 @@ class Fleet:
                 dev["bound"] = False
             if not dev["bound"]:
                 await self.bind(setup["id"], busid, force=force)
-            try:
-                out = await self.local.attach(setup["host"], busid, setup.get("usbip_port", 3240))
-            except UsbipError as e:
-                raise FleetError(f"attach failed: {e}", 500) from None
+            out = await self._attach_usbip(setup, busid)
             for _ in range(24):
                 ports = await self.local_ports()
                 p = self._match_port(ports, setup["id"], busid)
@@ -315,6 +368,45 @@ class Fleet:
             log.info("attached %s:%s (%s)", setup["id"], busid, dev["name"])
             await self._claim(setup, busid)
             return {"message": out or "attached", "port": p, "device": dev}
+
+    async def _attach_usbip(self, setup: dict[str, Any], busid: str) -> str:
+        """usbip attach: through the encrypted tunnel of the agent, or directly (old agent, not encrypted)."""
+        c = self.client(setup)
+        info: dict[str, Any] = {}
+        try:
+            await c.ensure()
+            if c.encrypted:
+                info = await c.ping()
+        except AgentError as e:
+            raise FleetError(e.message, e.status or 502) from None
+        if c.encrypted and info.get("tunnel"):
+            leases = list(getattr(c, "_leases", []) or [])
+            try:
+                port, proc = await tunnel.open_tunnel(setup["host"], c.port, c.fingerprint, c.token, leases,
+                                                      verify=bool(setup.get("verify_tls")))
+            except tunnel.TunnelError as e:
+                raise FleetError(f"attach failed: {e}", 502) from None
+            try:
+                out = await self.local.attach("127.0.0.1", busid, port)
+            except UsbipError as e:
+                why = await tunnel.tunnel_error(proc)
+                status = 423 if "reserved" in why else 500
+                raise FleetError(f"attach failed: {why or e}", status) from None
+            self._tunnel_procs[port] = proc  # keep the reference (the helper keeps running on its own)
+            tunnels = tunnel.load_tunnels()
+            tunnels[str(port)] = {"setup": setup["id"], "busid": busid, "host": setup["host"], "pid": proc.pid,
+                                  "at": time.time()}
+            tunnel.save_tunnels(tunnels)
+            return out or "attached (encrypted)"
+        if self.store.data().get("require_encryption"):
+            raise FleetError(f"{setup['name']} cannot tunnel USB/IP (agent before version 0.4): update it, or "
+                             "turn off 'require encryption'", 495)
+        try:
+            out = await self.local.attach(setup["host"], busid, setup.get("usbip_port", 3240))
+        except UsbipError as e:
+            raise FleetError(f"attach failed: {e}", 500) from None
+        log.warning("attached %s:%s WITHOUT encryption (old agent)", setup["id"], busid)
+        return out or "attached (not encrypted)"
 
     async def detach(self, ref: str, busid: str, unbind: bool = True) -> dict[str, Any]:
         """Detach the device from this PC and (by default) unbind it on the setup."""

@@ -62,11 +62,13 @@ def setup_dialog(win: "MainWindow", existing: dict[str, Any] | None = None,
     usbip_port = Adw.SpinRow.new_with_range(1, 65535, 1)
     usbip_port.set_title("USB/IP port")
     usbip_port.set_value(int(s.get("usbip_port") or 3240))
-    tls = Adw.SwitchRow(title="Use TLS", subtitle="The agent was installed with --tls", active=bool(s.get("tls")))
-    verify = Adw.SwitchRow(title="Verify the TLS certificate", subtitle="Off for self-signed certificates",
-                           active=bool(s.get("verify_tls")))
+    fp = Adw.EntryRow(title="TLS fingerprint (CONFIG_FINGERPRINT from install.sh; empty = trust at the first "
+                            "connection)", text=s.get("fingerprint") or "")
+    fp.add_css_class("monospace")
+    verify = Adw.SwitchRow(title="Certificate from a real CA", subtitle="Off for the self-signed certificate of "
+                           "the agent (it is pinned by its fingerprint)", active=bool(s.get("verify_tls")))
     notes = Adw.EntryRow(title="Notes (board, location, owner)", text=s.get("notes") or "")
-    for row in (name, host, port, token, usbip_port, tls, verify, notes):
+    for row in (name, host, port, token, fp, usbip_port, verify, notes):
         group.add(row)
 
     def save() -> None:
@@ -76,11 +78,20 @@ def setup_dialog(win: "MainWindow", existing: dict[str, Any] | None = None,
             return
         body: dict[str, Any] = {
             "name": name.get_text().strip() or h, "host": h, "port": int(port.get_value()),
-            "usbip_port": int(usbip_port.get_value()), "tls": tls.get_active(), "verify_tls": verify.get_active(),
+            "usbip_port": int(usbip_port.get_value()), "verify_tls": verify.get_active(),
             "notes": notes.get_text().strip(),
         }
         if token.get_text():
             body["token"] = token.get_text()
+        from ..agent_client import clean_fingerprint
+        fp_text = fp.get_text().strip()
+        if fp_text and not clean_fingerprint(fp_text):
+            fp.add_css_class("error")
+            win.toast("The fingerprint must be 64 hex characters (SHA-256)")
+            return
+        body["fingerprint"] = clean_fingerprint(fp_text)
+        if body["fingerprint"]:
+            body["transport"] = "tls"
         assert ok is not None
         ok.set_sensitive(False)
         ok.set_child(Gtk.Spinner(spinning=True))
@@ -164,7 +175,10 @@ def preferences_dialog(win: "MainWindow") -> None:
     poll = Adw.SpinRow.new_with_range(1, 120, 1)
     poll.set_title("Refresh interval (seconds)")
     poll.set_value(float(data.get("poll_interval") or 5))
-    for r in (client, token, port, poll):
+    require = Adw.SwitchRow(title="Require encryption",
+                            subtitle="Refuse agents without TLS (older than 0.4) and USB/IP without the tunnel",
+                            active=bool(data.get("require_encryption")))
+    for r in (client, token, port, poll, require):
         agents.add(r)
     page.add(agents)
 
@@ -194,6 +208,7 @@ def preferences_dialog(win: "MainWindow") -> None:
         data["agent_defaults"]["token"] = token.get_text()
         data["agent_defaults"]["port"] = int(port.get_value())
         data["poll_interval"] = int(poll.get_value())
+        data["require_encryption"] = require.get_active()
         data["local_usbip"]["command"] = cmd.get_text().strip() or None
         data["local_usbip"]["sudo"] = {0: None, 1: True, 2: False}[sudo.get_selected()]
         win.store.save()

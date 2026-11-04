@@ -26,6 +26,8 @@ DEFAULTS: dict[str, Any] = {
     "discovery_targets": ["255.255.255.255"],
     "setups": [],
     "sticky": [],
+    # true = refuse agents without TLS (agents before version 0.4) and USB/IP without the tunnel.
+    "require_encryption": False,
     # Your name for the setups ("in use by ..."). Empty = user@hostname.
     "client_name": "",
     # Flash: your own profiles and the last options per device.
@@ -40,7 +42,8 @@ DEFAULTS: dict[str, Any] = {
                  "usbip list -l", "uptime", "df -h /"],
 }
 
-SETUP_FIELDS = {"name", "host", "port", "token", "tls", "verify_tls", "notes", "tags", "usbip_port"}
+SETUP_FIELDS = {"name", "host", "port", "token", "tls", "verify_tls", "notes", "tags", "usbip_port", "fingerprint",
+                "transport"}
 
 
 def config_dir() -> Path:
@@ -117,6 +120,10 @@ class ConfigStore:
             "token": s.get("token", ""),
             "tls": bool(s.get("tls", False)),
             "verify_tls": bool(s.get("verify_tls", False)),
+            # The SHA-256 fingerprint of the agent's TLS certificate (pinned, like SSH known_hosts).
+            "fingerprint": (s.get("fingerprint") or "").replace(":", "").strip().lower(),
+            # "auto" (TLS when the agent has it), "tls" (only TLS) or "plain" (no encryption).
+            "transport": s.get("transport") or ("tls" if s.get("tls") else "auto"),
             "notes": s.get("notes", ""),
             "tags": list(s.get("tags") or []),
             "usbip_port": int(s.get("usbip_port") or 3240),

@@ -17,6 +17,7 @@ from typing import Any
 
 import aiohttp
 
+from .agent_client import AgentError
 from .fleet import Fleet, FleetError
 
 
@@ -39,8 +40,18 @@ async def _session(fleet: Fleet, ref: str, user: str | None) -> int:
     old = termios.tcgetattr(in_fd) if is_tty else None
     sys.stderr.write(f"\x1b[90mconnecting to {setup['name']} ({setup['host']})…\x1b[0m\r\n")
     try:
+        await client.ensure()
+    except AgentError as e:
+        sys.stderr.write(f"\x1b[31m{e.message}\x1b[0m\r\n")
+        return 1
+    if not client.encrypted:
+        sys.stderr.write("\x1b[33mwarning: this connection is NOT encrypted (old agent)\x1b[0m\r\n")
+    try:
         ws = await fleet.session.ws_connect(client.shell_url(cols, rows, user), headers=client.headers,
                                             ssl=client.ssl, heartbeat=30, max_msg_size=16 * 1024 * 1024)
+    except aiohttp.ServerFingerprintMismatch:
+        sys.stderr.write(f"\x1b[31m{client.mismatch_message()}\x1b[0m\r\n")
+        return 1
     except aiohttp.WSServerHandshakeError as e:
         msg = "the agent rejected the token" if e.status == 401 else f"HTTP {e.status}"
         sys.stderr.write(f"\x1b[31mcannot open a shell on {setup['name']}: {msg}\x1b[0m\r\n")
