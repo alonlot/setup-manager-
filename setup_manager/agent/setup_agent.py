@@ -2385,6 +2385,21 @@ class Handler(BaseHTTPRequestHandler):
         log.info("upload %s (%d bytes)", path, ln)
         return {"path": path, "size": ln, "sha256": digest.hexdigest()}
 
+    def _drain(self, limit=64 * 1024 * 1024):
+        """Read and drop a request body that we refuse, then close the connection."""
+        self.close_connection = True
+        try:
+            left = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        if left > limit:
+            return
+        while left > 0:
+            chunk = self.rfile.read(min(1024 * 1024, left))
+            if not chunk:
+                break
+            left -= len(chunk)
+
     def _download(self, qs):
         path = safe_path(self.agent.cfg, (qs.get("path") or [""])[0])
         if not os.path.isfile(path):
@@ -2410,7 +2425,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True  # do not read a body we will not use
                 return self._send_json(401, {"error": "unauthorized"})
             if path == "/api/files" and method == "PUT":
-                return self._send_json(200, self._upload(qs))
+                try:
+                    return self._send_json(200, self._upload(qs))
+                except ApiError:
+                    self._drain()  # read the body first, so the client gets the answer (not a reset)
+                    raise
             if path == "/api/files" and method == "GET":
                 return self._download(qs)
             body = self._body() if method == "POST" else {}
