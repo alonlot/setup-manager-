@@ -510,6 +510,49 @@ Agent (`/etc/setup-agent/config.json`): see `setup_manager/agent/config.example.
 Important keys: `token`, `port`, `run_as`, `auto_bind`, `protected`, `tls_cert`/`tls_key`, `discovery`.
 Restart after a change: `sudo systemctl restart setup-agent`.
 
+## Update everything (this PC and all setup PCs)
+
+```bash
+cd setup-manager
+./update-lab.sh --dry-run      # see the plan first
+./update-lab.sh                # do it
+```
+
+The script:
+
+1. Updates this PC: `git pull`, then `./install-app.sh` (the app, the command, the sudo rule, dialout).
+2. Runs `setup-manager rollout`. For each setup PC, one after the other, it:
+   - copies the agent over SSH and installs it with sudo (with `--install-deps`, so usbip is installed when it is missing);
+   - gives the PC a **new unique random token** (32 bytes);
+   - saves the token and the **TLS fingerprint** (read over SSH, so the pin is safe) in your config;
+   - waits for the agent, and checks the version, TLS, the USB/IP tunnel, usbip and usbipd;
+   - detaches the devices that are attached to this PC from that setup before the restart, and attaches them again after it.
+3. At the end, when all the setup PCs are OK: turns on **Require encryption**, and removes the old shared default token.
+4. Checks this PC: usbip, the sudo rule, the vhci-hcd module, the dialout group.
+
+Before it starts, it shows a plan with each PC, its SSH target, its current version, and the devices of
+other people that will disconnect (the agent restarts). It asks once for your sudo password on the setup
+PCs (when they need one). It keeps the password in memory only and sends it only over SSH.
+
+**Nothing is lost when a PC fails** (off, wrong password, no network): the new token is saved as
+"pending" before the install. Run the same command again: it continues with the same token. The
+update uses SSH, not the agent token.
+
+| Option | Effect |
+|---|---|
+| `--dry-run` | Only show the plan |
+| `--only SETUP` | Only these setups (repeatable) |
+| `--ssh-user USER` | SSH user for setups without an SSH target yet. The target is saved per setup (`"ssh": "dev@10.0.0.5"`). |
+| `--ssh-port N` | Another SSH port |
+| `--keep-tokens` | Do not change the tokens |
+| `--no-install-deps` | Do not install usbip with apt |
+| `--no-require-encryption` | Do not turn on Require encryption |
+| `--yes` | Do not ask before the update (for scripts) |
+| `--skip-manager` | (update-lab.sh only) Do not update this PC |
+
+Tip: use SSH keys (`ssh-copy-id dev@bench-1`). Then only the sudo password is asked, once.
+After the update, close the app and open it again.
+
 ## Security
 
 ### How it connects

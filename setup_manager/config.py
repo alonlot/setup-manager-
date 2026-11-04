@@ -26,6 +26,8 @@ DEFAULTS: dict[str, Any] = {
     "discovery_targets": ["255.255.255.255"],
     "setups": [],
     "sticky": [],
+    # rollout: new tokens that are saved before the install (a failed run continues with them).
+    "rollout_pending": {},
     # true = refuse agents without TLS (agents before version 0.4) and USB/IP without the tunnel.
     "require_encryption": False,
     # Your name for the setups ("in use by ..."). Empty = user@hostname.
@@ -43,7 +45,7 @@ DEFAULTS: dict[str, Any] = {
 }
 
 SETUP_FIELDS = {"name", "host", "port", "token", "tls", "verify_tls", "notes", "tags", "usbip_port", "fingerprint",
-                "transport"}
+                "transport", "ssh"}
 
 
 def config_dir() -> Path:
@@ -124,6 +126,8 @@ class ConfigStore:
             "fingerprint": (s.get("fingerprint") or "").replace(":", "").strip().lower(),
             # "auto" (TLS when the agent has it), "tls" (only TLS) or "plain" (no encryption).
             "transport": s.get("transport") or ("tls" if s.get("tls") else "auto"),
+            # SSH target for deploy / rollout, e.g. "dev@192.168.1.20" (empty = ask, or USER@host).
+            "ssh": s.get("ssh") or "",
             "notes": s.get("notes", ""),
             "tags": list(s.get("tags") or []),
             "usbip_port": int(s.get("usbip_port") or 3240),

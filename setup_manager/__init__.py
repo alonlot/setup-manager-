@@ -1,6 +1,6 @@
 """Setup Manager: manage Linux setup PCs and their USB/IP devices."""
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"
 
 _LAB_NAMES = {"Lab", "Setup", "Device", "SerialConsole", "Reservation", "CommandResult", "FlashResult",
               "IdentifyResult", "LabError", "DeviceNotFound", "AmbiguousDevice", "BoardBusy", "FlashFailed",

@@ -164,6 +164,8 @@ def stop_agent(info):
         info["proc"].wait(5)
     except subprocess.TimeoutExpired:
         info["proc"].kill()
+    if info["proc"].stdout:
+        info["proc"].stdout.close()
     info["usbipd"].close()
 
 

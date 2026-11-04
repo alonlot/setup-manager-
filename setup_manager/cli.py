@@ -216,6 +216,15 @@ def cmd_flash(args: argparse.Namespace) -> None:
     sys.exit(0 if r["ok"] else 1)
 
 
+def cmd_rollout(args: argparse.Namespace) -> None:
+    from .rollout import Options, Rollout
+    logging.getLogger().setLevel(logging.ERROR)
+    opts = Options(only=args.only or [], ssh_user=args.ssh_user, ssh_port=args.ssh_port,
+                   rotate_tokens=not args.keep_tokens, install_deps=not args.no_install_deps,
+                   require_encryption=not args.no_require_encryption, yes=args.yes, dry_run=args.dry_run)
+    sys.exit(Rollout(STORE, opts).run())
+
+
 def cmd_trust(args: argparse.Namespace) -> None:
     f = Fleet(STORE)
     if args.forget or args.fingerprint:
@@ -362,7 +371,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     if not args.no_add:
         existing = STORE.get_setup(args.name or host)
         fields = {"name": args.name or host, "host": host, "token": agent_token, "fingerprint": fingerprint,
-                  "transport": "tls" if fingerprint else "auto"}
+                  "transport": "tls" if fingerprint else "auto", "ssh": target}
         if existing:
             r = _run(lambda f: f.update_setup(existing["id"], fields))
         else:
@@ -484,6 +493,18 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--timeout", type=float, default=300)
     p.add_argument("--list-profiles", action="store_true")
     p.set_defaults(fn=cmd_flash)
+
+    p = sub.add_parser("rollout", help="update the agent on every setup PC, with a new unique token for each")
+    p.add_argument("--only", action="append", metavar="SETUP", help="only this setup (repeatable)")
+    p.add_argument("--ssh-user", help="SSH user for setups without an SSH target (default: ask, or your user)")
+    p.add_argument("--ssh-port", type=int)
+    p.add_argument("--keep-tokens", action="store_true", help="do not change the tokens")
+    p.add_argument("--no-install-deps", action="store_true", help="do not install usbip with apt on the setups")
+    p.add_argument("--no-require-encryption", action="store_true",
+                   help="do not turn on 'require encryption' at the end")
+    p.add_argument("--yes", "-y", action="store_true", help="do not ask before the update")
+    p.add_argument("--dry-run", action="store_true", help="only show the plan")
+    p.set_defaults(fn=cmd_rollout)
 
     p = sub.add_parser("trust", help="show or set the TLS certificate fingerprint of a setup")
     p.add_argument("setup")
