@@ -35,7 +35,7 @@ LOG_RULES: list[tuple[str, Any, str, float, str]] = [
     (r"\bRP2040\b", "RP2040", "RP2", 0.85, "RP2040 named in the log"),
     (r"\bRP2350\b", "RP2350", "RP2", 0.85, "RP2350 named in the log"),
     # Nordic / Zephyr board targets (board/soc names in sample output).
-    (r"\b(nrf5[0-9]{2,3}|nrf91[0-9]{2}|nrf54[a-z][0-9]{2})(?:dk|_dk|dongle)?(?:[/@_]\w+)?\b",
+    (r"\b(nrf5[0-9]{3,4}|nrf91[0-9]{2}|nrf54[a-z][0-9]{2})(?:dk|_dk|dongle)?(?:[/@_]\w+)?\b",
      lambda m: "nRF" + m.group(1)[3:].upper(), "nRF", 0.75, "Nordic board or SoC name"),
     (r"Booting nRF Connect SDK", "nRF (family)", "nRF", 0.6, "nRF Connect SDK banner"),
     # Linux / U-Boot class.

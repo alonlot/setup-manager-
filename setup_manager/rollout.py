@@ -17,7 +17,6 @@ import getpass
 import os
 import secrets
 import shlex
-import shutil
 import subprocess
 import sys
 import time
@@ -83,19 +82,38 @@ class Rollout:
                 return await fn(f)
         return asyncio.run(go())
 
-    def _ssh_base(self) -> list[str]:
-        return ["ssh", "-o", "ConnectTimeout=15"] + (["-p", str(self.opts.ssh_port)] if self.opts.ssh_port else [])
+    def ssh_port(self, s: dict[str, Any]) -> int | None:
+        return self.opts.ssh_port or s.get("ssh_port") or None
 
-    def ssh(self, target: str, command: str, stdin: str | None = None, timeout: float = 120) -> tuple[int, str]:
-        p = subprocess.run(self._ssh_base() + [target, command], input=stdin, capture_output=True, text=True,
+    @staticmethod
+    def _batch() -> list[str]:
+        # No terminal (an AI agent, a script): SSH must fail at once, not wait for a password.
+        return [] if sys.stdin.isatty() else ["-o", "BatchMode=yes"]
+
+    def _ssh_base(self, port: int | None = None) -> list[str]:
+        return ["ssh", "-o", "ConnectTimeout=15"] + self._batch() + (["-p", str(port)] if port else [])
+
+    def ssh(self, target: str, command: str, stdin: str | None = None, timeout: float = 120,
+            port: int | None = None) -> tuple[int, str]:
+        p = subprocess.run(self._ssh_base(port) + [target, command], input=stdin, capture_output=True, text=True,
                            timeout=timeout)
         return p.returncode, (p.stdout + p.stderr).strip()
 
-    def scp(self, target: str, files: list[Path], remote_dir: str) -> tuple[int, str]:
-        cmd = ["scp", "-q"] + (["-P", str(self.opts.ssh_port)] if self.opts.ssh_port else [])
+    def scp(self, target: str, files: list[Path], remote_dir: str, port: int | None = None) -> tuple[int, str]:
+        cmd = ["scp", "-q"] + self._batch() + (["-P", str(port)] if port else [])
         p = subprocess.run(cmd + [str(f) for f in files] + [f"{target}:{remote_dir}/"], capture_output=True,
                            text=True, timeout=120)
         return p.returncode, (p.stdout + p.stderr).strip()
+
+    def _sudo_password(self, target: str) -> str:
+        env = os.environ.get("SETUP_MANAGER_SUDO_PASSWORD")
+        if env:
+            return env
+        if self.opts.ask_secret is getpass.getpass and not sys.stdin.isatty():
+            raise RuntimeError(f"sudo on {target} needs a password, and there is no terminal to ask it. Run "
+                               "./update-lab.sh once in a terminal, or allow sudo without a password on the "
+                               "setup PC, or set SETUP_MANAGER_SUDO_PASSWORD")
+        return self.opts.ask_secret("sudo password on the setup PCs (asked once, kept in memory only): ")
 
     # -- plan -----------------------------------------------------------------------
     def targets(self) -> list[dict[str, Any]]:
@@ -151,26 +169,26 @@ class Rollout:
     def upgrade(self, s: dict[str, Any], target: str, here: list[str]) -> Result:
         r = Result(s["id"])
         sid = s["id"]
+        port = self.ssh_port(s)
         try:
-            rc, out = self.ssh(target, "echo SM_SSH_OK")
+            rc, out = self.ssh(target, "echo SM_SSH_OK", port=port)
             if rc != 0 or "SM_SSH_OK" not in out:
                 raise RuntimeError(f"SSH to {target} failed: {out[-300:]}")
             r.steps.append("ssh ok")
-            rc, remote = self.ssh(target, "mktemp -d /tmp/setup-agent-XXXXXX")
+            rc, remote = self.ssh(target, "mktemp -d /tmp/setup-agent-XXXXXX", port=port)
             remote = remote.strip().splitlines()[-1] if remote.strip() else ""
             if rc != 0 or not remote.startswith("/tmp/setup-agent-"):
                 raise RuntimeError(f"cannot make a folder on {target}: {remote}")
-            rc, out = self.scp(target, [AGENT_DIR / f for f in AGENT_FILES], remote)
+            rc, out = self.scp(target, [AGENT_DIR / f for f in AGENT_FILES], remote, port=port)
             if rc != 0:
                 raise RuntimeError(f"copy to {target} failed: {out[-300:]}")
             r.steps.append("files copied")
 
             sudo = "sudo -n"
-            rc, out = self.ssh(target, "sudo -n true")
+            rc, out = self.ssh(target, "sudo -n true", port=port)
             if rc != 0:
                 if self.sudo_password is None:
-                    self.sudo_password = self.opts.ask_secret(
-                        "sudo password on the setup PCs (asked once, kept in memory only): ")
+                    self.sudo_password = self._sudo_password(target)
                 sudo = "sudo -S -p ''"
 
             data = self.store.data()
@@ -180,7 +198,9 @@ class Rollout:
                 data["rollout_pending"][sid] = token  # saved BEFORE the install: a failure can continue
                 self.store.save()
 
+            sticky = {x["busid"]: x for x in self.store.sticky() if x.get("setup") == sid and x["busid"] in here}
             if here:
+                # Fleet.detach turns "keep attached" off (a manual detach must); we restore it below.
                 self._fleet(lambda f: asyncio.gather(*(f.detach(sid, b, unbind=False) for b in here),
                                                      return_exceptions=True))
                 r.steps.append(f"detached here: {', '.join(here)}")
@@ -192,8 +212,8 @@ class Rollout:
                 args.append("--install-deps")
             cmd = f"{sudo} bash {shlex.quote(remote + '/install.sh')} {' '.join(shlex.quote(a) for a in args)}"
             rc, out = self.ssh(target, cmd, stdin=(self.sudo_password + "\n") if "-S" in sudo else None,
-                               timeout=900)
-            self.ssh(target, f"rm -rf {shlex.quote(remote)}")
+                               timeout=900, port=port)
+            self.ssh(target, f"rm -rf {shlex.quote(remote)}", port=port)
             if rc != 0:
                 if "incorrect password" in out or "Sorry, try again" in out:
                     self.sudo_password = None
@@ -205,7 +225,7 @@ class Rollout:
                 raise RuntimeError("the agent did not take the new token (install.sh output has another one)")
             r.steps.append("installed")
 
-            fields = {"token": new_token or s.get("token"), "ssh": target}
+            fields = {"token": new_token or s.get("token"), "ssh": target, "ssh_port": port}
             if fingerprint:
                 fields.update(fingerprint=fingerprint, transport="tls")
             self.store.update_setup(sid, fields)
@@ -222,6 +242,9 @@ class Rollout:
                         r.reattached.append(b)
                     except FleetError as e:
                         r.steps.append(f"attach {b} again failed: {e.message}")
+                    finally:
+                        if b in sticky:
+                            self.store.set_sticky(sid, b, True, sticky[b])
                 r.steps.append(f"attached again: {', '.join(r.reattached) or 'none'}")
             r.ok = r.version == self.version and r.encrypted
             if r.version != self.version:
@@ -241,7 +264,8 @@ class Rollout:
                 enc = self._fleet(lambda f: _encrypted(f, sid))
                 usbip = st.get("usbip") or {}
                 if not usbip.get("usbip_installed"):
-                    r.steps.append("WARNING: usbip is not installed on the setup PC")
+                    r.steps.append("WARNING: usbip does not work on the setup PC: "
+                                   + (usbip.get("usbip_hint") or "re-run install.sh with --install-deps"))
                 elif not usbip.get("usbipd_running"):
                     r.steps.append("WARNING: usbipd is not running on the setup PC")
                 r.steps.append(f"agent {st.get('version')} online" + (", TLS + USB/IP tunnel" if enc else ""))
@@ -254,8 +278,11 @@ class Rollout:
     # -- this PC -------------------------------------------------------------------------
     def check_this_pc(self) -> list[str]:
         notes = []
-        if not shutil.which("usbip"):
-            notes.append("usbip is not installed on this PC (Ubuntu: sudo apt install linux-tools-generic)")
+        from .usbip_local import LocalUsbip
+        local = LocalUsbip({"sudo": False}).info()  # "usbip version" needs no root
+        if not local["found"]:
+            notes.append("usbip does not work on this PC: "
+                         + (local.get("hint") or f"Ubuntu: sudo apt install linux-tools-{os.uname().release}"))
         if not os.path.exists("/etc/sudoers.d/setup-manager") and os.geteuid() != 0:
             notes.append("no sudo rule for usbip on this PC: run ./install-app.sh")
         if not os.path.exists("/sys/module/vhci_hcd") and not os.path.exists("/sys/devices/platform/vhci_hcd.0"):
@@ -270,6 +297,9 @@ class Rollout:
 
     # -- all -------------------------------------------------------------------------------
     def run(self) -> int:
+        if not (self.opts.yes or self.opts.dry_run) and self.opts.ask is input and not sys.stdin.isatty():
+            self.say("No terminal to answer questions: run it again with --yes.")
+            return 1
         setups = self.targets()
         if not setups:
             self.say("No setups in the config. Add one first: setup-manager deploy USER@HOST --name NAME")
@@ -322,7 +352,7 @@ class Rollout:
         if all_setups_ok and self.opts.require_encryption:
             data["require_encryption"] = True
             self.say("\nRequire encryption: ON (agents without TLS are refused from now on)")
-        if len(ok) == len(results) and self.opts.rotate_tokens and data["agent_defaults"].get("token"):
+        if all_setups_ok and self.opts.rotate_tokens and data["agent_defaults"].get("token"):
             data["agent_defaults"]["token"] = ""
             self.say("The old shared default token was removed: each PC has its own token now.")
         self.store.save()
@@ -342,5 +372,5 @@ class Rollout:
 
 async def _encrypted(f: Fleet, sid: str) -> bool:
     c = f.client(sid)
-    await c.ensure()
+    await f._agent_call(c.ensure())
     return c.encrypted

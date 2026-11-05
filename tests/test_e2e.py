@@ -2,6 +2,8 @@
 import asyncio
 import json
 
+import pytest
+
 from setup_manager.config import ConfigStore
 from setup_manager.fleet import Fleet, FleetError
 
@@ -96,4 +98,17 @@ def test_offline_setup(tmp_path):
                 await f.status("nope")
             except FleetError as err:
                 assert err.status == 404
+    run(go())
+
+
+def test_usb_of_an_offline_setup_is_a_fleet_error(tmp_path):
+    cfg = tmp_path / "m.json"
+    cfg.write_text(json.dumps({"setups": [{"id": "dead", "host": "127.0.0.1", "port": 1, "token": "x"}]}))
+
+    async def go():
+        async with Fleet(ConfigStore(cfg)) as f:
+            with pytest.raises(FleetError, match="cannot reach"):
+                await f.usb("dead")
+            with pytest.raises(FleetError, match="cannot reach"):
+                await f.serial_ports("dead")
     run(go())

@@ -28,6 +28,7 @@ class SerialMonitor(Gtk.Box):
         self.is_open = False
         self.visible = False
         self.polling = False
+        self._updating = False  # the port list is being replaced: ignore the dropdown's notify::selected
         self.offset = 0
         self.seen_events: set[tuple] = set()
         self.saved = bytearray()
@@ -108,25 +109,35 @@ class SerialMonitor(Gtk.Box):
             self.ports = ports
             labels = [f"{p['tty']}  ·  {p['name']}{'  (this PC)' if p['where'] == 'here' else ''}" for p in ports]
             cur = self.port
-            self.port_dd.set_model(Gtk.StringList.new(labels or ["(no serial port)"]))
             idx = 0
             for i, p in enumerate(ports):
                 if (select_busid and p["busid"] == select_busid) or (
                         not select_busid and cur and p["busid"] == cur["busid"] and p["tty"] == cur["tty"]):
                     idx = i
                     break
-            if ports:
-                self.port_dd.set_selected(idx)
-            self.port = ports[idx] if ports else None
-            if then_open and self.port and not self.is_open:
+            # set_model() selects item 0 and fires notify::selected. Keep self.port (the open one) until
+            # the right item is selected again, then act once if the selected port really changed.
+            was_open = self.is_open
+            self._updating = True
+            try:
+                self.port_dd.set_model(Gtk.StringList.new(labels or ["(no serial port)"]))
+                if ports:
+                    self.port_dd.set_selected(idx)
+            finally:
+                self._updating = False
+            self._port_changed()  # re-opens the new port itself when the selection moved while open
+            if then_open and self.port and not (self.is_open or was_open):
                 self.open()
 
         self.win.bridge.run(self.win.fleet.serial_ports(self.sid), done, lambda e: self._status(str(e)))
 
     def _port_changed(self) -> None:
+        if self._updating:
+            return
         i = self.port_dd.get_selected()
         new = self.ports[i] if 0 <= i < len(self.ports) else None
-        if new and self.port and new["busid"] == self.port["busid"] and new["tty"] == self.port["tty"]:
+        if new is self.port or (
+                new and self.port and new["busid"] == self.port["busid"] and new["tty"] == self.port["tty"]):
             return
         was_open = self.is_open
         self.is_open = False

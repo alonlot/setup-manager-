@@ -36,7 +36,7 @@ def mcu_pill(win: "MainWindow", sid: str, d: dict[str, Any]) -> Gtk.Widget | Non
     if r.get("at"):
         tip.append("identified " + time.strftime("%Y-%m-%d %H:%M", time.localtime(r["at"])) + ". Click to run again.")
     b = Gtk.Button(child=Gtk.Label(label=text, ellipsize=Pango.EllipsizeMode.END, max_width_chars=22),
-                   css_classes=["pill", color, "flat"], valign=Gtk.Align.CENTER, tooltip_text="\n".join(tip))
+                   css_classes=["sm-pill", color, "flat"], valign=Gtk.Align.CENTER, tooltip_text="\n".join(tip))
     b.connect("clicked", lambda *_: IdentifyDialog(win, sid, d).present(win))
     return b
 
@@ -229,7 +229,6 @@ class IdentifyDialog(Adw.Dialog):
                                          css_classes=["dim-label"]))
         opts = self.options()
         profile = self.profile_names[self.profile_row.get_selected()]
-        opts["profile"] = profile
 
         def done(r: dict[str, Any]) -> None:
             self._idle()
@@ -242,7 +241,7 @@ class IdentifyDialog(Adw.Dialog):
             self.result_box.append(Gtk.Label(label=getattr(e, "message", str(e)), xalign=0, wrap=True,
                                              css_classes=["error"]))
 
-        self.win.bridge.run(self.fleet.identify(self.sid, self.d["busid"], opts), done, fail)
+        self.win.bridge.run(self.fleet.identify(self.sid, self.d["busid"], opts, profile), done, fail)
 
     def _idle(self) -> None:
         self.run_btn.set_sensitive(True)

@@ -93,7 +93,19 @@ class FakeUsbipd:
         self.port = self.sock.getsockname()[1]
         self.imports = []
         self.peers = []
+        self.exported = []  # the busids that OP_REQ_DEVLIST lists
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def devlist_reply(self):
+        import struct
+        out = struct.pack("!HHII", 0x0111, 0x0005, 0, len(self.exported))
+        for busid in self.exported:
+            path = f"/sys/devices/pci0000:00/usb1/{busid}".encode()
+            # struct usbip_usb_device (312 bytes, bNumInterfaces = 1), then one usbip_usb_interface.
+            out += path.ljust(256, b"\0") + busid.encode().ljust(32, b"\0")
+            out += struct.pack("!IIIHHHBBBBBB", 1, 2, 3, 0x0483, 0x374B, 0x0100, 0, 0, 0, 1, 1, 1)
+            out += bytes([0xFF, 0, 0, 0])
+        return out
 
     def _loop(self):
         while True:
@@ -103,6 +115,15 @@ class FakeUsbipd:
                 return
             self.peers.append(addr[0])
             data = b""
+            while len(data) < 8:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            if data[2:4] == b"\x80\x05":  # OP_REQ_DEVLIST
+                conn.sendall(self.devlist_reply())
+                conn.close()
+                continue
             while len(data) < 40:
                 chunk = conn.recv(4096)
                 if not chunk:

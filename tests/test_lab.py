@@ -175,3 +175,27 @@ def test_pytest_plugin(manager_config, agent, fake_mcus, tmp_path):
     out = p.stdout + p.stderr
     assert "1 failed, 1 passed" in out, out
     assert "serial STMicroelectronics STM32 STLink (ttyACM0)" in out and "Booting Zephyr" in out, out
+
+
+def test_lost_reservation_is_taken_again(manager_config, agent):
+    """Released by force (the app's "take over"), or the agent restarted: the renew loop takes the
+    board again and uses the new lease, else the job is locked out of its own board."""
+    import json as _json
+    import urllib.request
+    from conftest import TOKEN, agent_url, insecure_ctx
+    with Lab(config=manager_config, owner="alice") as lab:
+        dev = lab.device("0483:374b")
+        res = dev.reserve(ttl=6)  # renews every 2 s
+        lease0 = res.lease
+        req = urllib.request.Request(agent_url(agent, "/api/release"), method="POST",
+                                     data=_json.dumps({"busid": dev.busid, "force": True}).encode(),
+                                     headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, context=insecure_ctx(), timeout=5) as r:
+            assert _json.loads(r.read())["released"] is True
+        time.sleep(3.5)
+        assert [r["owner"] for r in lab.reservations()] == ["alice"]
+        assert res.active and res.lease != lease0
+        dev.bind()  # the owner can still use the board
+        dev.unbind()
+        res.release()
+        assert lab.reservations() == []

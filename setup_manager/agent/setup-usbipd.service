@@ -6,7 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStartPre=-/sbin/modprobe usbip-host
-ExecStart=/usr/bin/env usbipd
+# Ubuntu: /usr/bin/usbipd is a wrapper that fails without linux-tools-$(uname -r). Then use the real
+# usbipd of the running kernel, else the newest one in /usr/lib/linux-tools*/ ($$ is a $ for systemd).
+ExecStart=/bin/sh -c 'usbipd --version >/dev/null 2>&1 && exec usbipd; k=$$(uname -r); for f in /usr/lib/linux-tools/$$k/usbipd $$(ls -d /usr/lib/linux-tools/*/usbipd /usr/lib/linux-tools-*/usbipd 2>/dev/null | sort -rV); do [ -x "$$f" ] && exec "$$f"; done; echo "usbipd does not run for kernel $$k: sudo apt install linux-tools-$$k" >&2; exit 1'
 Restart=always
 RestartSec=3
 

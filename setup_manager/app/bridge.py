@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from concurrent.futures import Future
 from typing import Any, Awaitable, Callable
 
 from gi.repository import GLib
+
+log = logging.getLogger("setup-manager")
 
 
 class AsyncBridge:
@@ -26,9 +29,13 @@ class AsyncBridge:
         def done(f: Future) -> None:
             try:
                 result = f.result()
-            except Exception as e:  # noqa: BLE001 - shown to the user
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as e:  # noqa: BLE001 - shown to the user (CancelledError is a BaseException)
                 if on_error:
                     GLib.idle_add(_once, on_error, e)
+                else:
+                    log.warning("%s failed: %r", getattr(coro, "__qualname__", "task"), e)
                 return
             if on_done:
                 GLib.idle_add(_once, on_done, result)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -39,7 +40,7 @@ def fmt_uptime(s: float | None) -> str:
 
 
 def pill(text: str, color: str) -> Gtk.Label:
-    lbl = Gtk.Label(label=text, valign=Gtk.Align.CENTER, css_classes=["pill", color])
+    lbl = Gtk.Label(label=text, valign=Gtk.Align.CENTER, css_classes=["sm-pill", color])
     return lbl
 
 
@@ -189,7 +190,7 @@ def device_row(win: "MainWindow", sid: str, d: dict[str, Any], show_setup: bool 
     item("Rename…", "rename", "document-edit-symbolic")
     item("USB reset (re-plug)", "reset", "view-refresh-symbolic")
     item("Copy bus ID", "copy-busid", "edit-copy-symbolic")
-    item("Copy usbip attach command", "copy-attach", "edit-copy-symbolic")
+    item("Copy attach command", "copy-attach", "edit-copy-symbolic")
 
     more = Gtk.MenuButton(icon_name="view-more-symbolic", popover=pop, valign=Gtk.Align.CENTER,
                           css_classes=["flat"], tooltip_text="More actions")
@@ -283,7 +284,7 @@ class RunPanel(Gtk.Box):
                     return [await fleet.exec(targets[0], command, timeout, None, user)]
                 except Exception as e:  # noqa: BLE001
                     return [{"setup": targets[0], "command": command, "error": getattr(e, "message", str(e))}]
-            return await fleet.exec_many(targets, command, timeout)
+            return await fleet.exec_many(targets, command, timeout, user=user)
 
         def done(results: list[dict[str, Any]]) -> None:
             self.button.set_sensitive(True)
@@ -357,13 +358,14 @@ class TerminalTab(Gtk.Box):
         self.sid = sid
         self.page: Adw.TabPage | None = None
         self.running = False
+        self.pid: int | None = None
 
         self.bar = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN)
         bar_box = Gtk.Box(spacing=10, css_classes=["term-bar"])
         self.bar_label = Gtk.Label(label="Disconnected", xalign=0, hexpand=True)
         bar_box.append(self.bar_label)
         rb = Gtk.Button(label="Reconnect", css_classes=["suggested-action"])
-        rb.connect("clicked", lambda *_: self.connect())
+        rb.connect("clicked", lambda *_: self.start())
         bar_box.append(rb)
         self.bar.set_child(bar_box)
         self.append(self.bar)
@@ -379,9 +381,11 @@ class TerminalTab(Gtk.Box):
         keys.connect("key-pressed", self._key)
         self.term.add_controller(keys)
         self._apply_colors()
-        Adw.StyleManager.get_default().connect("notify::dark", lambda *_: self._apply_colors())
+        # The style manager is a global singleton: close() must disconnect this, else it keeps the tab alive.
+        self._style_handler: int | None = Adw.StyleManager.get_default().connect(
+            "notify::dark", lambda *_: self._apply_colors())
         self.append(self.term)
-        self.connect()
+        self.start()
 
     def _apply_colors(self) -> None:
         if Adw.StyleManager.get_default().get_dark():
@@ -393,7 +397,8 @@ class TerminalTab(Gtk.Box):
             "#5e5c64", "#ed333b", "#57e389", "#f8e45c", "#51a1ff", "#c061cb", "#4fd2fd", "#f6f5f4")]
         self.term.set_colors(fg, bg, palette)
 
-    def connect(self) -> None:
+    def start(self) -> None:
+        """Start (or restart) the shell client. Not named connect(): that is GObject.Object.connect."""
         if self.running:
             return
         argv, env = shell_argv(self.win.store.path, self.sid)
@@ -409,9 +414,24 @@ class TerminalTab(Gtk.Box):
             self.running = False
             self.bar_label.set_label(f"Cannot start the shell client: {error.message}")
             self.bar.set_reveal_child(True)
+            return
+        self.pid = pid
+
+    def close(self) -> None:
+        """The tab goes away: end the shell client and drop the global signal handler."""
+        if self._style_handler is not None:
+            Adw.StyleManager.get_default().disconnect(self._style_handler)
+            self._style_handler = None
+        pid, self.pid = self.pid, None
+        if pid:
+            try:
+                os.kill(pid, signal.SIGHUP)
+            except ProcessLookupError:
+                pass
 
     def _exited(self, term: Vte.Terminal, status: int) -> None:
         self.running = False
+        self.pid = None
         self.bar_label.set_label("Disconnected from the setup.")
         self.bar.set_reveal_child(True)
         if self.page:

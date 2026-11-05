@@ -15,6 +15,7 @@ import os
 import socket
 import ssl
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -41,9 +42,17 @@ def load_tunnels() -> dict[str, dict[str, Any]]:
 def save_tunnels(t: dict[str, dict[str, Any]]) -> None:
     path = state_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(t, indent=1))
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(t, indent=1))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 async def open_tunnel(host: str, port: int, fingerprint: str, token: str, leases: list[str] | None = None,

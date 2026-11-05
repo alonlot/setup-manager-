@@ -89,13 +89,14 @@ def test_full_rollout(manager_config, remote, monkeypatch):
     assert cfg.data()["require_encryption"] is True
     assert cfg.data()["agent_defaults"]["token"] == ""
     assert cfg.data()["rollout_pending"] == {}
-    # The device that was attached here is attached again (with the new token, through the tunnel).
+    # The device that was attached here is attached again: plain USB/IP (the default), let in by the
+    # agent with the new token.
     assert "attached again: 1-2" in text
 
     async def check():
         async with Fleet(ConfigStore(manager_config)) as f:
             ports = await f.local_ports()
-            assert [(p["setup"], p["busid"], p["encrypted"]) for p in ports] == [("bench", "1-2", True)]
+            assert [(p["setup"], p["busid"], p["encrypted"]) for p in ports] == [("bench", "1-2", False)]
             await f.detach("bench", "1-2")
     asyncio.run(check())
     assert "2 of 2 setup PCs updated" in text and bundled_version() in text
@@ -145,3 +146,70 @@ def test_unreachable_pc(manager_config, remote, monkeypatch):
     o, out = opts(only=["bench2"])
     assert Rollout(ConfigStore(manager_config), o).run() == 2
     assert "SSH to dev@10.255.255.1 failed" in out.getvalue()
+
+
+def test_only_one_setup_keeps_the_shared_token_and_keep_attached(manager_config, remote, monkeypatch):
+    monkeypatch.setenv("FAKE_SUDO_PASSWORD", "pw")
+
+    async def attach():
+        async with Fleet(ConfigStore(manager_config)) as f:
+            await f.attach("bench", "1-2")
+            await f.set_sticky("bench", "1-2", True)
+    asyncio.run(attach())
+
+    o, out = opts(only=["bench"])
+    assert Rollout(ConfigStore(manager_config), o).run() == 0, out.getvalue()
+    cfg = ConfigStore(manager_config)
+    # bench2 still uses the shared default token: it must stay until every setup has its own.
+    assert cfg.data()["agent_defaults"]["token"] == "old-shared-token"
+    assert cfg.data()["require_encryption"] is False
+    # The device was detached for the update and attached again: "keep attached" stays on.
+    assert "attached again: 1-2" in out.getvalue()
+    assert [(x["setup"], x["busid"]) for x in cfg.sticky()] == [("bench", "1-2")]
+
+    async def cleanup():
+        async with Fleet(ConfigStore(manager_config)) as f:
+            await f.detach("bench", "1-2")
+    asyncio.run(cleanup())
+
+
+def test_ssh_port_is_saved_per_setup(manager_config, remote, monkeypatch):
+    monkeypatch.setenv("FAKE_SUDO_PASSWORD", "pw")
+    data = json.loads(manager_config.read_text())
+    data["setups"][0]["ssh_port"] = 2222
+    manager_config.write_text(json.dumps(data))
+    o, out = opts(only=["bench"])
+    assert Rollout(ConfigStore(manager_config), o).run() == 0, out.getvalue()
+    log = remote["log"].read_text()
+    assert "-p 2222" in log
+    assert ConfigStore(manager_config).get_setup("bench")["ssh_port"] == 2222
+
+
+# --------------------------------------------------------------------------- no terminal (an AI agent, a script)
+
+def test_no_terminal_without_yes_does_not_start(manager_config, remote):
+    o, out = opts(yes=False, ask=input)  # the real prompt: there is no terminal under pytest
+    assert Rollout(ConfigStore(manager_config), o).run() == 1
+    assert "--yes" in out.getvalue()
+    assert not remote["log"].exists()
+
+
+def test_no_terminal_sudo_password_from_the_environment(manager_config, remote, monkeypatch):
+    import getpass
+    monkeypatch.setenv("FAKE_SUDO_PASSWORD", "pw")
+    o, out = opts(only=["bench"], ask_secret=getpass.getpass)
+    # Without the variable: a clear error for the PC, not a hang or a traceback.
+    assert Rollout(ConfigStore(manager_config), o).run() == 2
+    assert "no terminal to ask it" in out.getvalue() and "SETUP_MANAGER_SUDO_PASSWORD" in out.getvalue()
+    monkeypatch.setenv("SETUP_MANAGER_SUDO_PASSWORD", "pw")
+    o, out = opts(only=["bench"], ask_secret=getpass.getpass)
+    assert Rollout(ConfigStore(manager_config), o).run() == 0, out.getvalue()
+    # SSH must not wait for a password that nobody can type.
+    assert "-o BatchMode=yes" in remote["log"].read_text()
+
+
+def test_update_lab_needs_yes_without_a_terminal(tmp_path):
+    import subprocess
+    script = Path(__file__).resolve().parent.parent / "update-lab.sh"
+    p = subprocess.run(["bash", str(script)], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert p.returncode == 1 and "--yes" in p.stderr

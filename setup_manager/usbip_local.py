@@ -61,9 +61,11 @@ class LocalUsbip:
     def __init__(self, settings: dict[str, Any] | None = None):
         self.settings = settings or {}
         self.last_error: str | None = None
+        self._resolved: tuple[list[str], bool, str] | None = None
 
     def update(self, settings: dict[str, Any]) -> None:
         self.settings = settings or {}
+        self._resolved = None
 
     @property
     def use_sudo(self) -> bool:
@@ -72,10 +74,36 @@ class LocalUsbip:
             return not IS_WINDOWS and hasattr(os, "geteuid") and os.geteuid() != 0
         return bool(sudo)
 
-    def _command(self) -> list[str]:
+    def _resolve(self, force: bool = False) -> tuple[list[str], bool, str] | None:
+        """Linux, one-word command: (argv, works, wrapper error) with the same fallback as the agent.
+
+        On Ubuntu /usr/bin/usbip is a wrapper that fails ("not found for kernel") when the tools of
+        the running kernel are missing; then the real binary in /usr/lib/linux-tools*/ is used.
+        """
         cmd = self.settings.get("command") or ("usbip.exe" if IS_WINDOWS else "usbip")
         argv = list(cmd) if isinstance(cmd, list) else shlex.split(cmd, posix=not IS_WINDOWS)
+        if IS_WINDOWS or len(argv) != 1:
+            return None
+        if force or self._resolved is None:
+            from .agent import setup_agent as sa
+            self._resolved = sa.resolve_tool(argv, "usbip", ["version"])
+        return self._resolved
+
+    def _command(self) -> list[str]:
+        resolved = self._resolve()
+        if resolved:
+            argv = resolved[0]
+        else:
+            cmd = self.settings.get("command") or ("usbip.exe" if IS_WINDOWS else "usbip")
+            argv = list(cmd) if isinstance(cmd, list) else shlex.split(cmd, posix=not IS_WINDOWS)
         return (["sudo", "-n"] if self.use_sudo else []) + argv
+
+    def _hint(self) -> str | None:
+        resolved = self._resolve()
+        if resolved and "not found for kernel" in resolved[2]:
+            from .agent import setup_agent as sa
+            return sa.kernel_tools_hint()
+        return None
 
     async def _run(self, argv: list[str], timeout: float = 30) -> tuple[int, str]:
         try:
@@ -90,10 +118,14 @@ class LocalUsbip:
             p.kill()
             raise UsbipError(f"{' '.join(argv)} timed out") from None
         text = out.decode(errors="replace").strip()
+        if p.returncode != 0 and "not found for kernel" in text:
+            self._resolve(force=True)  # the next call uses the real binary when there is one now
+            text += f"\nHint: {self._hint() or 'install linux-tools for this kernel'}"
         if p.returncode != 0 and self.use_sudo and "password is required" in text:
             text += ("\nHint: allow passwordless usbip, e.g. in /etc/sudoers.d/usbip:\n"
                      f"  {os.environ.get('USER', 'youruser')} ALL=(root) NOPASSWD: "
-                     f"{shutil.which('usbip') or '/usr/bin/usbip'}, {shutil.which('modprobe') or '/sbin/modprobe'}")
+                     f"{shutil.which('usbip') or '/usr/bin/usbip'}, /usr/lib/linux-tools/*/usbip, "
+                     f"{shutil.which('modprobe') or '/sbin/modprobe'}")
         return p.returncode or 0, text
 
     async def usbip(self, *args: str, timeout: float = 30) -> tuple[int, str]:
@@ -138,5 +170,11 @@ class LocalUsbip:
     def info(self) -> dict[str, Any]:
         argv = self._command()
         exe = argv[2] if self.use_sudo else argv[0]
-        return {"command": " ".join(argv), "found": shutil.which(exe) is not None, "sudo": self.use_sudo,
-                "platform": sys.platform, "error": self.last_error}
+        resolved = self._resolve()
+        found = resolved[1] if resolved else shutil.which(exe) is not None
+        hint = self._hint()  # set when the Ubuntu wrapper fails (also when the real binary works)
+        error = self.last_error
+        if resolved and not resolved[1] and hint and not error:
+            error = f"{resolved[2].splitlines()[0]} ({hint})"
+        return {"command": " ".join(argv), "found": found, "sudo": self.use_sudo, "path": exe,
+                "platform": sys.platform, "error": error, "hint": hint}

@@ -13,7 +13,8 @@ API (all routes except /api/ping need "Authorization: Bearer <token>"):
   GET  /api/ping                     name, version (no auth)
   GET  /api/status                   PC status
   GET  /api/usb[?all=1]              USB devices (all=1 also shows hubs)
-  POST /api/usb/bind    {busid, force}
+  POST /api/usb/bind    {busid, force, restore_owner}
+  POST /api/usb/allow   {busid}  (plain USB/IP: let the caller's IP attach for 30 s)
   POST /api/usb/unbind  {busid}
   POST /api/usb/reset   {busid}
   POST /api/usb/identify {busid, reset, baud, duration, script, after_script, tty, user}
@@ -37,7 +38,9 @@ API (all routes except /api/ping need "Authorization: Bearer <token>"):
 import argparse
 import base64
 import collections
+import errno
 import fcntl
+import glob
 import hashlib
 import hmac
 import json
@@ -55,6 +58,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -83,15 +87,25 @@ DEFAULTS = {
     "tls_cert": "",
     "tls_key": "",
     "tls_dir": "",
-    # USB/IP: "tunnel" (default with TLS) = port 3240 is blocked from the network, USB/IP works only
-    # through the encrypted tunnel on the agent port. "open" = port 3240 stays open (not encrypted).
-    "usbip_network": "tunnel",
+    # USB/IP from the network (with TLS; the token always goes only over TLS):
+    #   "open" (default) = the agent does not touch port 3240: `usbip attach` by hand works as without
+    #            Setup Manager, also when the agent is stopped. Any PC can attach a shared device.
+    #   "manual" = a device that Setup Manager shares can be attached only by a PC that asked with the
+    #            token; a device that you share by hand works for everybody (a filter in the agent).
+    #   "tunnel" = only the encrypted tunnel on the agent port: port 3240 is blocked from the network.
+    "usbip_network": "open",
     "usbip_port": 3240,
+    # The port of the filter for plain USB/IP ("manual"). Port 3240 from the network goes to it.
+    "usbip_relay_port": 3241,
     # User for shells and commands. Empty = the user the agent runs as (root).
     "run_as": "",
     "shell": "/bin/bash",
     "usbip_cmd": "usbip",
     "usbipd_cmd": "usbipd",
+    # Where the real usbip/usbipd binaries of the kernel tools are (Ubuntu). /usr/bin/usbip there is a
+    # wrapper that fails when the tools of the running kernel are missing; the agent then uses these.
+    # The env var SETUP_AGENT_TOOLS_DIRS (dirs separated by ":") replaces the default.
+    "kernel_tools_dirs": [],
     # Start usbipd and load usbip-host when they are not running.
     "manage_usbipd": True,
     # Rules: "1-1.2" (busid), "0483:374b" (vid:pid), "0483:*", "0483:374b:SERIAL"
@@ -175,6 +189,71 @@ def split_cmd(value):
     return shlex.split(str(value))
 
 
+# Ubuntu: /usr/bin/usbip(d) of linux-tools-common runs /usr/lib/linux-tools/<kernel>/usbip(d) and
+# prints "WARNING: usbip not found for kernel ..." (rc=2) when the tools of this kernel are missing.
+KERNEL_TOOLS_MSG = "not found for kernel"
+KERNEL_TOOLS_DIRS = ["/usr/lib/linux-tools/*", "/usr/lib/linux-tools-*"]
+
+
+def kernel_tools_hint():
+    return "install the usbip tools for this kernel: sudo apt install linux-tools-%s" % os.uname().release
+
+
+def version_key(text):
+    """Sort key for kernel versions: "6.8.0-45-generic" -> (6, 8, 0, 45)."""
+    return tuple(int(n) for n in re.findall(r"\d+", text))
+
+
+def kernel_tools_candidates(name, dirs=None, release=None):
+    """The real usbip/usbipd binaries: the one of the running kernel first, then the newest."""
+    if dirs is None:
+        env = os.environ.get("SETUP_AGENT_TOOLS_DIRS")
+        dirs = env.split(":") if env else KERNEL_TOOLS_DIRS
+    release = release or os.uname().release
+    found = []
+    for pattern in dirs:
+        for d in glob.glob(pattern):
+            path = os.path.join(d, name)
+            if path not in found and os.path.isfile(path) and os.access(path, os.X_OK):
+                found.append(path)
+
+    def key(path):
+        ver = os.path.basename(os.path.dirname(path))
+        ver = ver[len("linux-tools-"):] if ver.startswith("linux-tools-") else ver
+        this_kernel = ver == release or release.startswith(ver + "-")
+        return (this_kernel, version_key(ver))
+    return sorted(found, key=key, reverse=True)
+
+
+def try_tool(argv, timeout=10):
+    """Run a command, return (ok, output). A missing command is not ok."""
+    try:
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, "%s: %s" % (argv[0], e)
+    return p.returncode == 0, p.stdout.decode(errors="replace").strip()
+
+
+def resolve_tool(cmd, name, probe_args, dirs=None):
+    """Find a usbip/usbipd command that works. Returns (argv, ok, error).
+
+    A command of one word (default "usbip") that is missing or is the Ubuntu wrapper without the
+    tools of this kernel is replaced by the real binary in the kernel tools dirs. The usbip tools
+    of another kernel version work: they use sysfs and the usbipd protocol, which do not change.
+    """
+    argv = split_cmd(cmd)
+    ok, out = try_tool(argv + probe_args)
+    if ok:
+        return argv, True, ""
+    missing = argv and shutil.which(argv[0]) is None
+    if len(argv) == 1 and (missing or KERNEL_TOOLS_MSG in out):
+        for path in kernel_tools_candidates(name, dirs):
+            if try_tool([path] + probe_args)[0]:
+                return [path], True, out
+    return argv, False, out
+
+
 def match_rule(rule, dev):
     """Return True if a rule ("busid", "vid:pid", "vid:*", "vid:pid:serial") matches a device."""
     rule = str(rule).strip().lower()
@@ -252,18 +331,95 @@ class UsbManager:
         self.base = os.path.join(cfg["sysfs_root"], "bus", "usb", "devices")
         self.ids = UsbIds()
         self.lock = threading.Lock()
+        self._usbip = None  # (argv, ok, error, time) of resolve_tool
+        self._usbip_lock = threading.Lock()
+        # The devices that Setup Manager shared (busid -> device rule). Kept in a file, so that an
+        # agent restart does not make them available without encryption.
+        self.shared_path = cfg.get("shared_state_file") or os.path.join(
+            os.path.dirname(os.path.abspath(cfg.get("files_dir") or "/var/lib/setup-agent/files")),
+            "shared-by-manager.json")
+        self.shared_lock = threading.Lock()
+        self.shared = self._load_shared()
+        self.unbound_owner = {}  # busid -> (who had shared it, device rule): for bind(restore_owner=True)
+
+    # -- who shared a device: Setup Manager, or somebody by hand --------------
+    def _load_shared(self):
+        try:
+            with open(self.shared_path) as f:
+                data = json.load(f)
+            return dict((str(k), str(v)) for k, v in data.items()) if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_shared(self):
+        folder = os.path.dirname(self.shared_path)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".shared.", dir=folder)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.shared, f)
+            os.replace(tmp, self.shared_path)
+        except OSError as e:
+            log.warning("cannot save %s: %s", self.shared_path, e)
+
+    def mark_shared(self, dev, on):
+        with self.shared_lock:
+            if on:
+                self.shared[dev["busid"]] = device_rule(dev).lower()
+            elif self.shared.pop(dev["busid"], None) is None:
+                return
+            self._save_shared()
+
+    def shared_by_manager(self, dev):
+        """True when Setup Manager shared this device (it is bound and it is the same device)."""
+        with self.shared_lock:
+            rule = self.shared.get(dev["busid"])
+            if rule is None:
+                return False
+            if not dev["bound"]:  # unshared (or unplugged): the next bind decides again
+                self.shared.pop(dev["busid"], None)
+                self._save_shared()
+                return False
+            return rule == device_rule(dev).lower()
 
     # -- usbip / usbipd ------------------------------------------------------
+    def _tools_dirs(self):
+        return self.cfg.get("kernel_tools_dirs") or None
+
+    def resolve_usbip(self, force=False):
+        """The usbip command to run (cached; a failed result is checked again after 30 s)."""
+        with self._usbip_lock:
+            r = self._usbip
+            if force or r is None or (not r[1] and time.time() - r[3] > 30):
+                argv, ok, err = resolve_tool(self.cfg["usbip_cmd"], "usbip", ["version"], self._tools_dirs())
+                if ok and err:
+                    log.warning("usbip wrapper does not work (%s), using %s", err.splitlines()[0], argv[0])
+                r = self._usbip = (argv, ok, err, time.time())
+            return r
+
     def usbip(self, *args, timeout=20):
-        cmd = split_cmd(self.cfg["usbip_cmd"]) + list(args)
-        try:
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
-        except FileNotFoundError:
-            raise ApiError(500, "usbip is not installed on this PC (command: %s)" % cmd[0])
-        except subprocess.TimeoutExpired:
-            raise ApiError(504, "usbip %s timed out" % " ".join(args))
-        out = p.stdout.decode(errors="replace").strip()
-        return p.returncode, out
+        argv = self.resolve_usbip()[0]
+        for attempt in (1, 2):
+            cmd = argv + list(args)
+            try:
+                p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+                out = p.stdout.decode(errors="replace").strip()
+                rc = p.returncode
+            except FileNotFoundError:
+                rc, out = 127, "usbip is not installed on this PC (command: %s)" % cmd[0]
+            except subprocess.TimeoutExpired:
+                raise ApiError(504, "usbip %s timed out" % " ".join(args))
+            if rc == 0 or (rc != 127 and KERNEL_TOOLS_MSG not in out) or attempt == 2:
+                break
+            new = self.resolve_usbip(force=True)[0]  # e.g. the kernel tools were removed
+            if new == argv:
+                break
+            argv = new
+        if rc == 127:
+            raise ApiError(500, "%s. Re-run install.sh with --install-deps, or %s" % (out, kernel_tools_hint()))
+        if rc != 0 and KERNEL_TOOLS_MSG in out:
+            out += "\nHint: " + kernel_tools_hint()
+        return rc, out
 
     def usbipd_running(self):
         try:
@@ -296,10 +452,13 @@ class UsbManager:
                 if started:
                     notes.append("started setup-usbipd.service")
             if not started:
+                argv, ok, err = resolve_tool(self.cfg["usbipd_cmd"], "usbipd", ["--version"], self._tools_dirs())
+                if not ok and KERNEL_TOOLS_MSG in err:
+                    notes.append("usbipd: %s. Hint: %s" % (err.splitlines()[0], kernel_tools_hint()))
                 try:
-                    subprocess.run(split_cmd(self.cfg["usbipd_cmd"]) + ["-D"], timeout=10,
+                    subprocess.run(argv + ["-D"], timeout=10,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    notes.append("started usbipd -D")
+                    notes.append("started %s -D" % " ".join(argv))
                 except (OSError, subprocess.TimeoutExpired) as e:
                     notes.append("could not start usbipd: %s" % e)
             for _ in range(20):
@@ -311,8 +470,16 @@ class UsbManager:
         return notes
 
     def usbip_info(self):
+        argv, ok, err = self.resolve_usbip()[:3]
+        wrapper = KERNEL_TOOLS_MSG in err
         return {
-            "usbip_installed": shutil.which(split_cmd(self.cfg["usbip_cmd"])[0]) is not None,
+            # True when usbip really runs ("usbip version"), not only when /usr/bin/usbip exists.
+            "usbip_installed": ok,
+            "usbip_path": " ".join(argv),
+            "usbip_error": None if ok else (err[:500] or "usbip does not run"),
+            # Also set when the agent works around a broken wrapper with the real binary.
+            "usbip_hint": kernel_tools_hint() if wrapper else
+            None if ok else "install usbip: re-run install.sh with --install-deps",
             "usbipd_running": self.usbipd_running(),
             "module_loaded": self.module_loaded(),
         }
@@ -425,6 +592,8 @@ class UsbManager:
             dev = self._device(e, entries)
             if dev is None or (dev["is_hub"] and not include_hubs):
                 continue
+            shared = self.shared_by_manager(dev)
+            dev["shared_by"] = ("setup-manager" if shared else "hand") if dev["bound"] else None
             devices.append(dev)
         devices.sort(key=lambda d: busid_key(d["busid"]))
         return devices
@@ -444,7 +613,9 @@ class UsbManager:
         return dev
 
     # -- actions ---------------------------------------------------------------
-    def bind(self, busid, force=False):
+    def bind(self, busid, force=False, restore_owner=False):
+        """Share a device. restore_owner: it was unbound for a moment (flash, identify): a device that
+        was shared by hand stays "by hand" (plain USB/IP from the network keeps working for it)."""
         with self.lock:
             dev = self.get(busid)
             if dev["bound"]:
@@ -461,6 +632,9 @@ class UsbManager:
             dev = self.get(busid)
             if not dev["bound"]:
                 raise ApiError(500, "usbip bind failed (rc=%d): %s" % (rc, out))
+            before = self.unbound_owner.pop(busid, None)
+            if not (restore_owner and before == ("hand", device_rule(dev).lower())):
+                self.mark_shared(dev, True)  # (a device that was already bound by hand stays "by hand")
             log.info("bound %s (%s)", busid, dev["name"])
             return {"device": dev, "message": out}
 
@@ -469,10 +643,13 @@ class UsbManager:
             dev = self.get(busid)
             if not dev["bound"]:
                 return {"device": dev, "message": "not bound"}
+            self.unbound_owner[busid] = ("setup-manager" if self.shared_by_manager(dev) else "hand",
+                                         device_rule(dev).lower())
             rc, out = self.usbip("unbind", "-b", busid)
             dev = self.get(busid)
             if dev["bound"]:
                 raise ApiError(500, "usbip unbind failed (rc=%d): %s" % (rc, out))
+            self.mark_shared(dev, False)
             log.info("unbound %s (%s)", busid, dev["name"])
             return {"device": dev, "message": out}
 
@@ -601,11 +778,14 @@ def shell_argv(cfg, user, command=None):
             pwd.getpwnam(user)
         except KeyError:
             raise ApiError(400, "unknown user %s" % user)
-        tool = "runuser" if shutil.which("runuser") else "su"
-        argv = [tool, "-l", user]
         if command is not None:
-            argv += ["-c", command]
-        return argv, user_home(user)
+            # Not a login shell (-l): that would drop the environment (SM_* of flash and identify)
+            # and the working directory that Popen sets.
+            if shutil.which("runuser"):
+                return ["runuser", "-u", user, "--", shell, "-c", command], user_home(user)
+            return ["su", "-p", "-s", shell, user, "-c", command], user_home(user)
+        tool = "runuser" if shutil.which("runuser") else "su"
+        return [tool, "-l", user], user_home(user)
     if command is not None:
         return [shell, "-lc", command], user_home(me)
     return [shell, "-l"], user_home(me)
@@ -624,13 +804,18 @@ def base_env(user):
     return env
 
 
+def num(value, name, kind=float):
+    """A request parameter as a number, or a 400 error that names it."""
+    try:
+        return kind(value)
+    except (TypeError, ValueError):
+        raise ApiError(400, "%s must be a number" % name)
+
+
 def run_command(cfg, command, timeout=60, cwd=None, user=None, extra_env=None):
     if not isinstance(command, str) or not command.strip():
         raise ApiError(400, "command is required")
-    try:
-        timeout = float(timeout or 60)
-    except (TypeError, ValueError):
-        raise ApiError(400, "timeout must be a number")
+    timeout = num(timeout or 60, "timeout")
     timeout = max(1.0, min(timeout, float(cfg.get("exec_timeout_max") or 3600)))
     user = user or cfg.get("run_as") or current_user()
     argv, home = shell_argv(cfg, user, command)
@@ -650,7 +835,15 @@ def run_command(cfg, command, timeout=60, cwd=None, user=None, extra_env=None):
             os.killpg(p.pid, signal.SIGKILL)
         except OSError:
             pass
-        out, err = p.communicate()
+        try:
+            out, err = p.communicate(timeout=2)
+        except subprocess.TimeoutExpired as e:
+            # A grandchild left the process group but still holds our pipes: do not wait for it.
+            out, err = e.stdout or b"", e.stderr or b""
+            p.stdout.close()
+            p.stderr.close()
+            p.kill()
+            p.wait()
     truncated = len(out) > MAX_OUTPUT or len(err) > MAX_OUTPUT
     log.info("exec as %s (rc=%s, %.1fs): %s", user, p.returncode, time.time() - start, command[:200])
     return {
@@ -1024,7 +1217,8 @@ class SerialSession:
         self.max_bytes = max_bytes
         self.buf = bytearray()
         self.start = 0
-        self.fd = None
+        self.fd = None  # owned by the reader thread: it is the only one that closes it while it runs
+        self.want_close = False  # ask the reader thread to close the fd (pause)
         self.paused = False
         self.closed = False
         self.events = collections.deque(maxlen=200)
@@ -1042,7 +1236,8 @@ class SerialSession:
         return self.start + len(self.buf)
 
     def _event(self, text):
-        self.events.append({"offset": self.end, "time": time.time(), "text": text})
+        with self.cond:  # read() iterates the events under this lock
+            self.events.append({"offset": self.end, "time": time.time(), "text": text})
 
     def _open(self):
         try:
@@ -1055,22 +1250,34 @@ class SerialSession:
         except (OSError, termios.error) as e:
             self._event("cannot set %d baud: %s" % (self.baud, e))
         with self.cond:
+            if self.fd is not None or self.paused:  # opened by someone else, or paused, meanwhile
+                os.close(fd)
+                return self.fd is not None
             self.fd = fd
         return True
 
     def _close_fd(self):
+        """Close the fd now. Only when the reader thread is not running (or did not answer)."""
         with self.cond:
-            fd, self.fd = self.fd, None
+            self._close_locked()
+
+    def _close_locked(self):
+        fd, self.fd = self.fd, None
+        self.want_close = False
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
+        self.cond.notify_all()
 
     def _loop(self):
         last_try = 0.0
         while not self.closed:
-            fd = self.fd
+            with self.cond:
+                if self.want_close:
+                    self._close_locked()
+                fd = self.fd
             if fd is None:
                 if not self.paused and time.time() - last_try > 0.3 and os.path.exists(self.path):
                     last_try = time.time()
@@ -1085,17 +1292,19 @@ class SerialSession:
                 time.sleep(0.05)
             if not ready:
                 continue
-            try:
-                chunk = os.read(fd, 65536)
-            except BlockingIOError:
-                continue
-            except OSError:
-                chunk = b""
-            if not chunk:
-                self._close_fd()
-                self._event("port disconnected")
-                continue
             with self.cond:
+                if self.want_close or self.fd != fd:  # closed meanwhile: the number can belong to another file now
+                    continue
+                try:
+                    chunk = os.read(fd, 65536)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    self._close_locked()
+                    self._event("port disconnected")
+                    continue
                 self.buf.extend(chunk)
                 if len(self.buf) > self.max_bytes:
                     drop = len(self.buf) - self.max_bytes
@@ -1109,6 +1318,9 @@ class SerialSession:
         deadline = time.time() + max(0.0, min(30.0, float(wait or 0)))
         with self.cond:
             since = self.end if since is None or since < 0 else since
+            reset = since > self.end  # from a session that was closed and opened again
+            if reset:
+                since = self.end
             while since >= self.end and not self.closed:
                 left = deadline - time.time()
                 if left <= 0:
@@ -1118,57 +1330,77 @@ class SerialSession:
             s = max(since, self.start)
             data = bytes(self.buf[s - self.start: s - self.start + max(1, int(max_bytes))])
             events = [e for e in self.events if e["offset"] >= since]
-            return {"data": data, "offset": s + len(data), "start": self.start, "end": self.end, "lost": lost,
-                    "events": events, "connected": self.fd is not None, "paused": self.paused, "baud": self.baud}
+            r = {"data": data, "offset": s + len(data), "start": self.start, "end": self.end, "lost": lost,
+                 "events": events, "connected": self.fd is not None, "paused": self.paused, "baud": self.baud}
+            if reset:
+                r["reset"] = True
+            return r
 
     def write(self, data):
         self.last_used = time.time()
         with self.wlock:
             deadline = time.time() + 5
             while data:
-                fd = self.fd
-                if fd is None:
-                    raise ApiError(409, "%s is not connected%s" % (self.path, " (paused)" if self.paused else ""))
+                with self.cond:  # the reader thread closes the fd only under this lock
+                    fd = self.fd
+                    if fd is None:
+                        raise ApiError(409, "%s is not connected%s" % (self.path,
+                                                                       " (paused)" if self.paused else ""))
+                    try:
+                        n = os.write(fd, data)
+                        data = data[n:]
+                        continue
+                    except BlockingIOError:
+                        if time.time() > deadline:
+                            raise ApiError(504, "write to %s timed out" % self.path)
+                    except OSError as e:
+                        raise ApiError(500, "write to %s failed: %s" % (self.path, e))
                 try:
-                    n = os.write(fd, data)
-                    data = data[n:]
-                except BlockingIOError:
-                    if time.time() > deadline:
-                        raise ApiError(504, "write to %s timed out" % self.path)
                     select.select([], [fd], [], 0.2)
-                except OSError as e:
-                    raise ApiError(500, "write to %s failed: %s" % (self.path, e))
+                except (OSError, ValueError):
+                    time.sleep(0.05)
 
     def set_baud(self, baud):
         baud = int(baud)
         if baud == self.baud:
             return
         self.baud = baud
-        if self.fd is not None:
-            try:
-                _set_serial(self.fd, baud)
-            except (OSError, termios.error) as e:
-                raise ApiError(400, "cannot set %d baud: %s" % (baud, e))
+        with self.cond:
+            if self.fd is not None:
+                try:
+                    _set_serial(self.fd, baud)
+                except (OSError, termios.error) as e:
+                    raise ApiError(400, "cannot set %d baud: %s" % (baud, e))
         self._event("baud rate %d" % baud)
 
     def modem(self, line, on):
-        if self.fd is None:
-            return ["%s: not connected" % os.path.basename(self.path)]
-        try:
-            _modem(self.fd, line, on)
-            return []
-        except OSError as e:
-            return ["%s: %s" % (os.path.basename(self.path), e.strerror or e)]
+        with self.cond:
+            if self.fd is None:
+                return ["%s: not connected" % os.path.basename(self.path)]
+            try:
+                _modem(self.fd, line, on)
+                return []
+            except OSError as e:
+                return ["%s: %s" % (os.path.basename(self.path), e.strerror or e)]
 
     def pause(self, why="paused"):
-        self.paused = True
-        self._close_fd()
+        """Close the port (for flashing). Returns when the reader thread has let go of it."""
+        with self.cond:
+            self.paused = True
+            self.want_close = True
+            self.cond.notify_all()
+            deadline = time.time() + 0.3
+            while self.fd is not None and self.thread.is_alive() and time.time() < deadline:
+                self.cond.wait(0.05)
+            self._close_locked()  # only needed when the reader thread did not answer
         self._event(why)
 
     def resume(self):
         if not self.paused:
             return
-        self.paused = False
+        with self.cond:
+            self.paused = False
+            self.want_close = False
         for _ in range(50):  # the port can need some time to come back after flashing
             if os.path.exists(self.path) and self._open():
                 self._event("resumed")
@@ -1254,18 +1486,22 @@ class HubCapture:
         self.paths = list(paths)
         self.sessions = {}
         self.created = []
+        self.restore = {}  # path -> the baud rate the monitor had before, for sessions that stay open
         self.offsets = {}
         self.data = dict((p, bytearray()) for p in self.paths)
         self.events = dict((p, []) for p in self.paths)
         for p in self.paths:
-            existed = p in hub.sessions and not hub.sessions[p].closed
+            existing = hub.sessions.get(p)
+            before = None if existing is None or existing.closed else existing.baud
             try:
                 s = hub.open(p, baud)
             except ApiError as e:
                 self.events[p].append(e.message)
                 continue
-            if not existed:
+            if before is None:
                 self.created.append(p)
+            else:
+                self.restore[p] = before
             self.sessions[p] = s
             self.offsets[p] = s.end
 
@@ -1292,6 +1528,11 @@ class HubCapture:
             self.events[p] = [e["text"] for e in r["events"]]
         for p in self.created:  # a port that the monitor did not use before: give it back
             self.hub.close(p)
+        for p, baud in self.restore.items():  # the monitor keeps its own baud rate
+            try:
+                self.sessions[p].set_baud(baud)
+            except ApiError:
+                pass
 
     def all_bytes(self):
         return b"".join(bytes(b) for b in self.data.values())
@@ -1506,8 +1747,12 @@ class TlsFront:
         while True:
             try:
                 conn, addr = self.sock.accept()
-            except OSError:
-                return
+            except OSError as e:
+                if self.sock.fileno() < 0:  # the listening socket was closed: shutting down
+                    return
+                log.warning("TLS accept failed: %s", e)  # EMFILE, ENOBUFS, ECONNABORTED, ...: try again
+                time.sleep(0.1)
+                continue
             threading.Thread(target=self._handle, args=(conn, addr), name="tls", daemon=True).start()
 
     def _handle(self, conn, addr):
@@ -1606,26 +1851,248 @@ class TlsFront:
             a.tunnels.pop(tid, None)
 
 
+OP_REQ_DEVLIST = 0x8005
+OP_REP_IMPORT = 0x0003
+USBIP_ST_NA = 0x01  # "Request Failed" in the usbip client
+USBIP_DEVICE_SIZE = 312  # struct usbip_usb_device; bNumInterfaces is its last byte
+
+
+class UsbipRelay:
+    """Plain USB/IP from the network, for the devices that were shared by hand ("usbip_network": "manual").
+
+    iptables sends port 3240 from the network here. The agent reads the first USB/IP request: an
+    import of a device that Setup Manager shared (or that is reserved) is refused, everything else is
+    relayed to usbipd. `usbip list -r` shows only the devices that can be attached in this way.
+    """
+
+    def __init__(self, agent, port):
+        self.agent = agent
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)  # IPv4 too
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("::", int(port)))
+        except OSError:
+            if sock is not None:
+                sock.close()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("0.0.0.0", int(port)))
+            except OSError:
+                sock.close()
+                raise
+        sock.listen(64)
+        self.sock = sock
+        self.port = sock.getsockname()[1]
+
+    def serve(self):
+        while True:
+            try:
+                conn, addr = self.sock.accept()
+            except OSError as e:
+                if self.sock.fileno() < 0:
+                    return
+                log.warning("USB/IP relay accept failed: %s", e)
+                time.sleep(0.1)
+                continue
+            threading.Thread(target=self._handle, args=(conn, addr), name="usbip-relay", daemon=True).start()
+
+    @staticmethod
+    def _recv_at_least(conn, data, n):
+        while len(data) < n:
+            more = conn.recv(4096)
+            if not more:
+                raise EOFError("closed before the USB/IP request")
+            data += more
+        return data
+
+    def _handle(self, conn, addr):
+        ip = addr[0][7:] if addr[0].startswith("::ffff:") else addr[0]
+        try:
+            conn.settimeout(10)
+            self._handle_inner(conn, ip)
+        except (OSError, EOFError, ValueError, struct.error) as e:
+            log.debug("plain USB/IP from %s ended: %s", ip, e)
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _usbipd(self):
+        return socket.create_connection(("127.0.0.1", int(self.agent.cfg.get("usbip_port") or 3240)), timeout=10)
+
+    def _handle_inner(self, conn, ip):
+        a = self.agent
+        data = self._recv_at_least(conn, b"", 8)
+        version, code = struct.unpack("!HH", data[:4])
+        if code == OP_REQ_IMPORT:
+            data = self._recv_at_least(conn, data, 40)
+            busid = data[8:40].split(b"\0", 1)[0].decode(errors="replace")
+            why = a.plain_usbip_refusal(busid)
+            if why:
+                log.warning("plain USB/IP from %s for %s refused: %s", ip, busid, why)
+                conn.sendall(struct.pack("!HHI", version, OP_REP_IMPORT, USBIP_ST_NA))
+                conn.close()
+                return
+            back = self._usbipd()
+            tid = id(back)
+            a.tunnels[tid] = {"ip": ip, "busid": busid, "at": time.time(), "source": "usbip"}
+            log.info("plain USB/IP from %s for %s (shared by hand)", ip, busid)
+            try:
+                relay(conn, back, data)
+            finally:
+                a.tunnels.pop(tid, None)
+        elif code == OP_REQ_DEVLIST:
+            back = self._usbipd()
+            try:
+                back.settimeout(10)
+                back.sendall(data[:8])
+                reply = b""
+                while len(reply) < 4 * 1024 * 1024:
+                    more = back.recv(65536)
+                    if not more:
+                        break
+                    reply += more
+            finally:
+                back.close()
+            conn.sendall(a.filter_devlist(reply))
+            conn.close()
+        else:
+            conn.close()
+
+
 FW_COMMENT = "setup-agent-usbip"
+FW_ALLOW = "setup-agent-usbip-allow"  # one client IP that may connect to usbipd for a short time
+ALLOW_SECONDS = 30  # enough for `usbip attach`; the connection stays after the rule is gone
 
 
-def usbip_firewall(block, port=3240):
-    """Block (or unblock) USB/IP from the network, so that it works only through the encrypted tunnel."""
-    done = []
+def _rules_with_comment(tool, table, chain, comment):
+    """The rules (as argument lists after the chain name) that have exactly this comment."""
+    p = subprocess.run([tool, "-t", table, "-S", chain], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    out = []
+    for line in p.stdout.decode(errors="replace").splitlines():
+        if not line.startswith("-A "):
+            continue
+        args = shlex.split(line)
+        if "--comment" in args and args[args.index("--comment") + 1] == comment:
+            out.append(args[2:])
+    return out
+
+
+def _delete_with_comment(tool, table, chain, comment):
+    for args in _rules_with_comment(tool, table, chain, comment):
+        subprocess.run([tool, "-t", table, "-D", chain] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def usbip_direct_setup(port=3240):
+    """Prepare plain USB/IP for the clients that Setup Manager lets in (POST /api/usb/allow).
+
+    An allowed client IP connects to usbipd directly (the kernel does the USB/IP, no relay). The rule
+    for the IP is removed after ALLOW_SECONDS; an ESTABLISHED rule keeps its connection. Returns True
+    when it works (iptables with conntrack).
+    """
+    ok = False
     for tool in ("iptables", "ip6tables"):
         if not shutil.which(tool):
             continue
-        rule = ["INPUT", "-p", "tcp", "--dport", str(port), "!", "-i", "lo", "-m", "comment", "--comment",
-                FW_COMMENT, "-j", "DROP"]
-        exists = subprocess.run([tool, "-C"] + rule, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if block and exists.returncode != 0:
-            p = subprocess.run([tool, "-I"] + rule, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            done.append("%s: %s" % (tool, "blocked" if p.returncode == 0 else p.stdout.decode(errors="replace")))
-        elif not block:
-            while subprocess.run([tool, "-D"] + rule, stdout=subprocess.DEVNULL,
+        for table, chain in (("filter", "INPUT"), ("nat", "PREROUTING")):
+            _delete_with_comment(tool, table, chain, FW_ALLOW)  # from an earlier run
+        est = ["INPUT", "-p", "tcp", "--dport", str(port), "!", "-i", "lo", "-m", "conntrack", "--ctstate",
+               "ESTABLISHED,RELATED", "-m", "comment", "--comment", FW_COMMENT, "-j", "ACCEPT"]
+        while subprocess.run([tool, "-D"] + est, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            pass
+        # At the top, above the REJECT rule (which is already there).
+        p = subprocess.run([tool, "-I"] + est, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if p.returncode == 0:
+            ok = ok or tool == "iptables"
+        else:
+            log.warning("%s: no plain USB/IP for Setup Manager (conntrack): %s", tool,
+                        p.stdout.decode(errors="replace").strip())
+    return ok
+
+
+def usbip_allow_ip(ip, port=3240, on=True):
+    """Let one client IP connect to usbipd (on=False: remove that again)."""
+    tool = "ip6tables" if ":" in ip else "iptables"
+    rules = [("filter", ["INPUT", "-s", ip, "-p", "tcp", "--dport", str(port), "-m", "comment", "--comment",
+                         FW_ALLOW, "-j", "ACCEPT"]),
+             ("nat", ["PREROUTING", "-s", ip, "-p", "tcp", "--dport", str(port), "-m", "comment", "--comment",
+                      FW_ALLOW, "-j", "RETURN"])]  # RETURN: not to the filter for devices shared by hand
+    for table, rule in rules:
+        base = [tool, "-t", table]
+        if on:
+            if subprocess.run(base + ["-C"] + rule, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+                p = subprocess.run(base + ["-I"] + rule, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                if p.returncode != 0:
+                    raise ApiError(500, "cannot let %s in for USB/IP: %s" % (ip, p.stdout.decode(errors="replace")))
+        else:
+            while subprocess.run(base + ["-D"] + rule, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL).returncode == 0:
-                done.append("%s: unblocked" % tool)
+                pass
+
+
+def usbip_firewall(block, port=3240, redirect_to=None):
+    """Block (or unblock) USB/IP from the network, so that it works only through the encrypted tunnel.
+
+    The rule refuses the connection (TCP reset): a `usbip attach` by hand from another PC fails at
+    once with "connection refused", instead of hanging for two minutes (older agents used DROP).
+    With redirect_to (a port), port `port` from the network goes to that port instead (the filter
+    for plain USB/IP of devices shared by hand); the block stays as a safety net.
+    """
+    done = []
+    match = ["INPUT", "-p", "tcp", "--dport", str(port), "!", "-i", "lo", "-m", "comment", "--comment", FW_COMMENT]
+    rule = match + ["-j", "REJECT", "--reject-with", "tcp-reset"]
+    old_rule = match + ["-j", "DROP"]
+
+    def delete_all(tool, r):
+        n = 0
+        while subprocess.run([tool, "-D"] + r, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            n += 1
+        return n
+
+    for tool in ("iptables", "ip6tables"):
+        if not shutil.which(tool):
+            continue
+        replaced = delete_all(tool, old_rule)  # the DROP rule of an older agent
+        if block:
+            exists = subprocess.run([tool, "-C"] + rule, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if exists.returncode != 0:
+                p = subprocess.run([tool, "-I"] + rule, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                done.append("%s: %s" % (tool, "blocked" if p.returncode == 0 else p.stdout.decode(errors="replace")))
+        else:
+            n = replaced + delete_all(tool, rule)
+            done += ["%s: unblocked" % tool] * n
+        done += _usbip_redirect(tool, port, redirect_to if block else None)
+        if not block:  # open: no rule of the agent on port 3240 at all
+            for table, chain in (("filter", "INPUT"), ("nat", "PREROUTING")):
+                _delete_with_comment(tool, table, chain, FW_COMMENT)
+                _delete_with_comment(tool, table, chain, FW_ALLOW)
     return done
+
+
+def _usbip_redirect(tool, port, to_port):
+    """The nat rule that sends port `port` from the network to `to_port` (None: remove it)."""
+    notes = []
+    want = None
+    if to_port:
+        want = ["PREROUTING", "-p", "tcp", "--dport", str(port), "!", "-i", "lo", "-m", "comment",
+                "--comment", FW_COMMENT, "-j", "REDIRECT", "--to-ports", str(to_port)]
+    have = False
+    for args in _rules_with_comment(tool, "nat", "PREROUTING", FW_COMMENT):
+        if want and args[-2:] == ["--to-ports", str(to_port)]:
+            have = True
+            continue
+        subprocess.run([tool, "-t", "nat", "-D", "PREROUTING"] + args, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    if want and not have:
+        r = subprocess.run([tool, "-t", "nat", "-I"] + want, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        notes.append("%s: %s" % (tool, "port %d from the network goes to the filter for devices shared by hand "
+                                       "(port %s)" % (port, to_port) if r.returncode == 0 else
+                                 "cannot redirect port %d (only the encrypted tunnel works): %s"
+                                 % (port, r.stdout.decode(errors="replace").strip())))
+    return notes
 
 
 class WebSocket:
@@ -1852,12 +2319,19 @@ class Agent:
         self.reservations = {}
         self.tunnels = {}
         self.tls_fingerprint = None
+        self.usbip_relay_port = None  # the filter for plain USB/IP of devices shared by hand
+        # Plain USB/IP for Setup Manager (the token goes over TLS, the USB data does not):
+        # "open" (port 3240 is open anyway), "allow" (the firewall lets the caller in), None (off).
+        self.usbip_direct = None
+        self.allowed = {}  # client IP -> time when its firewall rule goes
+        self.allow_lock = threading.Lock()
         self.res_lock = threading.Lock()
 
     # -- API handlers ----------------------------------------------------------
     def ping(self):
         return {"service": "setup-agent", "name": self.cfg["name"], "hostname": socket.gethostname(),
                 "tls": bool(self.tls_fingerprint), "tunnel": bool(self.tls_fingerprint),
+                "usbip_direct": bool(self.usbip_direct),
                 "fingerprint": self.tls_fingerprint,
                 "version": VERSION}
 
@@ -1894,8 +2368,17 @@ class Agent:
             "tls": bool(self.tls_fingerprint),
             "tunnel": bool(self.tls_fingerprint),
             "fingerprint": self.tls_fingerprint,
+            # USB/IP from the network: "manual" (devices shared by hand also work with plain usbip),
+            # "tunnel" (only the encrypted tunnel) or "open".
+            "usbip_network": self.usbip_network(),
+            "usbip_relay_port": self.usbip_relay_port,
             "time": time.time(),
         }
+
+    def usbip_network(self):
+        if not self.tls_fingerprint or str(self.cfg.get("usbip_network")).lower() == "open":
+            return "open"
+        return "manual" if self.usbip_relay_port else "tunnel"
 
     def usb_list(self, qs):
         include_hubs = qs.get("all", ["0"])[0] in ("1", "true", "yes")
@@ -1923,7 +2406,7 @@ class Agent:
             if c:
                 d["used_by"] = dict(c, source="claim", connected=c["ip"] in ips if ips else None)
             elif t:
-                d["used_by"] = {"ip": t["ip"], "host": reverse_name(t["ip"]), "source": "tunnel"}
+                d["used_by"] = {"ip": t["ip"], "host": reverse_name(t["ip"]), "source": t.get("source", "tunnel")}
             elif len(others) == 1:
                 d["used_by"] = {"ip": others[0], "host": reverse_name(others[0]), "source": "tcp"}
             elif others:
@@ -1970,7 +2453,7 @@ class Agent:
         owner = str(body.get("owner") or "").strip()[:80]
         if not owner:
             raise ApiError(400, "owner is required")
-        ttl = max(5.0, min(24 * 3600.0, float(body.get("ttl") or 300)))
+        ttl = max(5.0, min(24 * 3600.0, num(body.get("ttl") or 300, "ttl")))
         key = self._res_key(dev)
         with self.res_lock:
             r = self._active(key)
@@ -2018,6 +2501,70 @@ class Agent:
             raise ApiError(423, "%s is reserved by %s until %s" % (
                 busid, r["owner"], time.strftime("%H:%M:%S", time.localtime(r["expires"]))))
 
+    def usbip_allow(self, body, ip):
+        """Plain USB/IP for a client with the token (the token came over TLS): let its IP connect to
+        usbipd for ALLOW_SECONDS. The reservation of the device is checked like for the other actions."""
+        dev = self.usb.get(body.get("busid"))
+        if not self.usbip_direct:
+            raise ApiError(409, "plain USB/IP is off on this setup PC (installed with --tunnel-only, or the "
+                                "agent cannot change the firewall): use the encrypted tunnel")
+        port = int(self.cfg.get("usbip_port") or 3240)
+        if self.usbip_direct == "allow":
+            with self.allow_lock:
+                if ip not in self.allowed:
+                    usbip_allow_ip(ip, port, True)
+                self.allowed[ip] = time.time() + ALLOW_SECONDS
+        log.info("plain USB/IP: %s may attach %s", ip, dev["busid"])
+        return {"ip": ip, "port": port, "seconds": ALLOW_SECONDS, "busid": dev["busid"]}
+
+    def allow_janitor(self):
+        while True:
+            time.sleep(5)
+            with self.allow_lock:
+                for ip, until in list(self.allowed.items()):
+                    if until < time.time():
+                        try:
+                            usbip_allow_ip(ip, int(self.cfg.get("usbip_port") or 3240), False)
+                        except Exception:  # pragma: no cover
+                            log.exception("cannot remove the USB/IP rule of %s", ip)
+                        self.allowed.pop(ip, None)
+
+    def plain_usbip_refusal(self, busid):
+        """Why a plain USB/IP client (no token) cannot use this device, or None when it can."""
+        try:
+            dev = self.usb.get(busid)
+        except ApiError:
+            return None  # usbipd answers "no such device"
+        if dev["bound"] and self.usb.shared_by_manager(dev):
+            return ("shared by Setup Manager: it is available only through the encrypted tunnel "
+                    "(setup-manager attach)")
+        try:
+            self.check_lease(busid, [])
+        except ApiError as e:
+            return e.message
+        return None
+
+    def filter_devlist(self, reply):
+        """Keep in an OP_REP_DEVLIST only the devices that a plain USB/IP client may attach."""
+        if len(reply) < 12:
+            return reply
+        empty = reply[:8] + struct.pack("!I", 0)
+        try:
+            n = struct.unpack("!I", reply[8:12])[0]
+            pos, kept = 12, []
+            for _ in range(n):
+                head = reply[pos:pos + USBIP_DEVICE_SIZE]
+                if len(head) < USBIP_DEVICE_SIZE:
+                    return empty
+                size = USBIP_DEVICE_SIZE + 4 * bytearray(head)[USBIP_DEVICE_SIZE - 1]
+                busid = head[256:288].split(b"\0", 1)[0].decode(errors="replace")
+                if self.plain_usbip_refusal(busid) is None:
+                    kept.append(reply[pos:pos + size])
+                pos += size
+        except (struct.error, IndexError):
+            return empty
+        return reply[:8] + struct.pack("!I", len(kept)) + b"".join(kept)
+
     def busid_for_tty(self, tty):
         tty = os.path.basename(str(tty or ""))
         for d in self.usb.list(include_hubs=True):
@@ -2060,7 +2607,8 @@ class Agent:
     def serial_read(self, qs):
         q = dict((k, v[0]) for k, v in qs.items())
         s = self.hub.get(self.serial_path(q))
-        r = s.read(int(q.get("since", 0)), int(q.get("max", 65536)), float(q.get("wait", 0)))
+        r = s.read(num(q.get("since", 0), "since", int), num(q.get("max", 65536), "max", int),
+                   num(q.get("wait", 0), "wait"))
         r["data"] = base64.b64encode(r["data"]).decode()
         return r
 
@@ -2097,9 +2645,15 @@ class Agent:
             raise ApiError(404, "no folder %s" % path)
         out = []
         for name in sorted(os.listdir(path)):
-            st = os.stat(os.path.join(path, name))
-            out.append({"name": name, "size": st.st_size, "mtime": st.st_mtime,
-                        "dir": os.path.isdir(os.path.join(path, name))})
+            full = os.path.join(path, name)
+            try:
+                st = os.stat(full)
+            except OSError:  # a dangling symlink, or a file that disappeared
+                try:
+                    st = os.lstat(full)
+                except OSError:
+                    continue
+            out.append({"name": name, "size": st.st_size, "mtime": st.st_mtime, "dir": os.path.isdir(full)})
         return {"path": path, "files": out}
 
     def files_delete(self, body):
@@ -2132,15 +2686,15 @@ class Agent:
         paused = self.hub.pause(paths, "paused for flashing")
         starts = dict((ps.path, ps.end) for ps in paused)  # the monitor shows what comes after the flash
         try:
-            result = run_command(self.cfg, script, float(body.get("timeout") or 300), None, body.get("user"),
-                                 extra_env=env)
+            result = run_command(self.cfg, script, num(body.get("timeout") or 300, "timeout"), None,
+                                 body.get("user"), extra_env=env)
         finally:
             for s in paused:
                 s.resume()
             lock.release()
         log.info("flash %s with %s: rc=%s", dev["busid"], os.path.basename(fw) or "-", result["exit_code"])
         result["env"] = env
-        monitor = float(body.get("monitor_seconds") or 0)
+        monitor = num(body.get("monitor_seconds") or 0, "monitor_seconds")
         if monitor > 0:
             result["monitor"] = self._monitor_after(dev["busid"], body.get("tty"), body.get("baud"), monitor, starts)
         return result
@@ -2197,7 +2751,7 @@ class Agent:
             result = identify_capture(dev, paths, body.get("baud", "auto"), body.get("duration", 4),
                                       body.get("reset", "auto"), body.get("script") or "",
                                       body.get("after_script") or "", run_script, hw_reset,
-                                      float(body.get("script_timeout") or 30),
+                                      num(body.get("script_timeout") or 30, "script_timeout"),
                                       capture_factory=lambda ps, b: HubCapture(self.hub, ps, b))
             rc, info = run_probe(dev, "info")
             result["probe"] = info
@@ -2293,6 +2847,7 @@ class Agent:
 
 # The actions that need the lease while a device is reserved.
 LEASE_ROUTES = {("POST", "/api/usb/bind"), ("POST", "/api/usb/unbind"), ("POST", "/api/usb/reset"),
+                ("POST", "/api/usb/allow"),
                 ("POST", "/api/usb/identify"), ("POST", "/api/usb/flash"), ("POST", "/api/serial/write"),
                 ("POST", "/api/serial/reset")}
 
@@ -2300,6 +2855,7 @@ LEASE_ROUTES = {("POST", "/api/usb/bind"), ("POST", "/api/usb/unbind"), ("POST",
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "setup-agent/" + VERSION
+    body_read = 0  # bytes of the request body that _upload consumed (for _drain)
 
     @property
     def agent(self):
@@ -2362,34 +2918,49 @@ class Handler(BaseHTTPRequestHandler):
     def _upload(self, qs):
         """PUT /api/files?path=...: stream the request body to a file."""
         cfg = self.agent.cfg
-        path = safe_path(cfg, (qs.get("path") or [""])[0], create_dirs=True)
-        ln = int(self.headers.get("Content-Length") or -1)
+        ln = num(self.headers.get("Content-Length") or -1, "Content-Length", int)
         if ln < 0:
             raise ApiError(411, "Content-Length is required")
         if ln > int(cfg.get("max_upload") or 0):
             raise ApiError(413, "file too large (max_upload is %d bytes)" % cfg.get("max_upload"))
-        tmp = path + ".part"
+        try:
+            path = safe_path(cfg, (qs.get("path") or [""])[0], create_dirs=True)
+            fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".part",
+                                       dir=os.path.dirname(path))
+        except OSError as e:
+            raise ApiError(403 if e.errno in (errno.EACCES, errno.EPERM) else 500,
+                           "cannot write %s: %s" % ((qs.get("path") or [""])[0], e.strerror or e))
         digest = hashlib.sha256()
         left = ln
-        with open(tmp, "wb") as f:
-            while left > 0:
-                chunk = self.rfile.read(min(1024 * 1024, left))
-                if not chunk:
-                    raise ApiError(400, "upload cut off")
-                f.write(chunk)
-                digest.update(chunk)
-                left -= len(chunk)
-        os.replace(tmp, path)
-        os.chmod(path, 0o644)
-        chown_to(cfg.get("run_as"), path)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                while left > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, left))
+                    if not chunk:
+                        raise ApiError(400, "upload cut off")
+                    self.body_read += len(chunk)
+                    f.write(chunk)
+                    digest.update(chunk)
+                    left -= len(chunk)
+            os.chmod(tmp, 0o644)
+            chown_to(cfg.get("run_as"), tmp)
+            os.replace(tmp, path)
+        except OSError as e:
+            raise ApiError(403 if e.errno in (errno.EACCES, errno.EPERM) else 500,
+                           "cannot write %s: %s" % (path, e.strerror or e))
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         log.info("upload %s (%d bytes)", path, ln)
         return {"path": path, "size": ln, "sha256": digest.hexdigest()}
 
     def _drain(self, limit=64 * 1024 * 1024):
-        """Read and drop a request body that we refuse, then close the connection."""
+        """Read and drop (the rest of) a request body that we refuse, then close the connection."""
         self.close_connection = True
         try:
-            left = int(self.headers.get("Content-Length") or 0)
+            left = int(self.headers.get("Content-Length") or 0) - self.body_read
         except ValueError:
             return
         if left > limit:
@@ -2425,10 +2996,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True  # do not read a body we will not use
                 return self._send_json(401, {"error": "unauthorized"})
             if path == "/api/files" and method == "PUT":
+                self.body_read = 0
                 try:
                     return self._send_json(200, self._upload(qs))
-                except ApiError:
-                    self._drain()  # read the body first, so the client gets the answer (not a reset)
+                except Exception:
+                    # Read the body first, so the client gets the answer (not a connection reset).
+                    self._drain(int(self.agent.cfg.get("max_upload") or 0))
                     raise
             if path == "/api/files" and method == "GET":
                 return self._download(qs)
@@ -2439,12 +3012,14 @@ class Handler(BaseHTTPRequestHandler):
             routes = {
                 ("GET", "/api/status"): lambda: a.status(),
                 ("GET", "/api/usb"): lambda: a.usb_list(qs),
-                ("POST", "/api/usb/bind"): lambda: a.usb.bind(body.get("busid"), bool(body.get("force"))),
+                ("POST", "/api/usb/bind"): lambda: a.usb.bind(body.get("busid"), bool(body.get("force")),
+                                                              bool(body.get("restore_owner"))),
                 ("POST", "/api/usb/unbind"): lambda: a.usb.unbind(body.get("busid")),
                 ("POST", "/api/usb/reset"): lambda: a.usb.reset(body.get("busid")),
                 ("POST", "/api/usb/identify"): lambda: a.identify(body),
                 ("POST", "/api/usb/flash"): lambda: a.flash(body),
                 ("POST", "/api/usb/claim"): lambda: a.claim(body, self.real_ip()),
+                ("POST", "/api/usb/allow"): lambda: a.usbip_allow(body, self.real_ip()),
                 ("POST", "/api/usb/release"): lambda: a.release(body),
                 ("POST", "/api/usb/nickname"): lambda: a.set_nickname(body),
                 ("GET", "/api/serial"): lambda: {"sessions": a.hub.list()},
@@ -2462,7 +3037,7 @@ class Handler(BaseHTTPRequestHandler):
                 ("POST", "/api/usbipd/start"): lambda: {"notes": a.usb.ensure_usbipd(), **a.usb.usbip_info()},
                 ("POST", "/api/exec"): lambda: run_command(a.cfg, body.get("command"), body.get("timeout", 60),
                                                            body.get("cwd"), body.get("user")),
-                ("GET", "/api/log"): lambda: {"lines": list(LOG_RING)[-int((qs.get("n") or ["200"])[0]):]},
+                ("GET", "/api/log"): lambda: {"lines": list(LOG_RING)[-num((qs.get("n") or ["200"])[0], "n", int):]},
                 ("GET", "/api/config"): lambda: a.public_config(),
                 ("POST", "/api/config"): lambda: a.update_config(body),
             }
@@ -2593,10 +3168,30 @@ def main(argv=None):
     else:
         server = Server((cfg["listen"], int(cfg["port"])), agent)
         log.warning("TLS is off: the API and the shell are not encrypted")
+    mode = str(cfg.get("usbip_network") or "open").lower()
+    usbip_relay = None
+    if use_tls and mode == "manual":
+        try:
+            usbip_relay = UsbipRelay(agent, int(cfg.get("usbip_relay_port") or 3241))
+            threading.Thread(target=usbip_relay.serve, name="usbip-relay", daemon=True).start()
+        except OSError as e:
+            log.warning("cannot listen on port %s for plain USB/IP: %s. Devices shared by hand are not "
+                        "available from the network (only the encrypted tunnel works).",
+                        cfg.get("usbip_relay_port") or 3241, e)
+    agent.usbip_relay_port = usbip_relay.port if usbip_relay else None
+    block = bool(use_tls) and mode != "open"
     if os.geteuid() == 0:
-        block = bool(use_tls) and cfg.get("usbip_network", "tunnel") == "tunnel"
-        for note in usbip_firewall(block, int(cfg.get("usbip_port") or 3240)):
+        for note in usbip_firewall(block, int(cfg.get("usbip_port") or 3240), agent.usbip_relay_port):
             log.info("USB/IP port: %s", note)
+    if use_tls and not block:
+        agent.usbip_direct = "open"
+    elif use_tls and mode == "manual" and os.geteuid() == 0 and usbip_direct_setup(int(cfg.get("usbip_port") or 3240)):
+        agent.usbip_direct = "allow"
+        threading.Thread(target=agent.allow_janitor, name="usbip-allow", daemon=True).start()
+    if agent.usbip_direct:
+        log.info("USB/IP for Setup Manager: plain (the token goes over TLS), %s",
+                 "port %s is open" % (cfg.get("usbip_port") or 3240) if agent.usbip_direct == "open" else
+                 "the firewall lets each client in for %d s" % ALLOW_SECONDS)
 
     if os.geteuid() == 0:
         threading.Thread(target=agent.usb.ensure_usbipd, name="usbipd-init", daemon=True).start()

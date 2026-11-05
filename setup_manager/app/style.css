@@ -1,15 +1,15 @@
-.pill {
+.sm-pill {
   border-radius: 999px;
   padding: 2px 10px;
   font-size: 0.85em;
   font-weight: bold;
 }
-.pill.grey { background: alpha(currentColor, 0.1); color: alpha(currentColor, 0.75); }
-.pill.blue { background: alpha(@accent_bg_color, 0.18); color: @accent_color; }
-.pill.green { background: alpha(@success_bg_color, 0.18); color: @success_color; }
-.pill.amber { background: alpha(@warning_bg_color, 0.2); color: @warning_color; }
-.pill.red { background: alpha(@error_bg_color, 0.18); color: @error_color; }
-.pill.purple { background: alpha(#9141ac, 0.2); color: #c061cb; }
+.sm-pill.grey { background: alpha(currentColor, 0.1); color: alpha(currentColor, 0.75); }
+.sm-pill.blue { background: alpha(@accent_bg_color, 0.18); color: @accent_color; }
+.sm-pill.green { background: alpha(@success_bg_color, 0.18); color: @success_color; }
+.sm-pill.amber { background: alpha(@warning_bg_color, 0.2); color: @warning_color; }
+.sm-pill.red { background: alpha(@error_bg_color, 0.18); color: @error_color; }
+.sm-pill.purple { background: alpha(#9141ac, 0.2); color: #c061cb; }
 .dot { font-size: 0.75em; }
 .dot.green { color: @success_color; }
 .dot.red { color: @error_color; }

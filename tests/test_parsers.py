@@ -54,3 +54,24 @@ def test_match_rule_same_in_agent_and_manager():
     for rule, want in cases.items():
         assert agent_match(rule, dev) is want, rule
         assert fleet_match(rule, dev) is want, rule
+
+
+def test_local_usbip_falls_back_to_the_kernel_tools(tmp_path, monkeypatch):
+    import asyncio
+    from setup_manager.usbip_local import LocalUsbip
+    wrapper = tmp_path / "usbip"
+    wrapper.write_text('#!/bin/sh\necho "WARNING: usbip not found for kernel 6.8.0-45" >&2\nexit 2\n')
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("SETUP_AGENT_TOOLS_DIRS", str(tmp_path / "linux-tools" / "*"))
+    info = LocalUsbip({"sudo": False, "command": str(wrapper)}).info()
+    assert info["found"] is False and "sudo apt install linux-tools-" in info["error"]
+    real = tmp_path / "linux-tools" / "6.8.0-45-generic" / "usbip"
+    real.parent.mkdir(parents=True)
+    real.write_text('#!/bin/sh\necho "usbip (usbip-utils 2.0) $*"\n')
+    real.chmod(0o755)
+    u = LocalUsbip({"sudo": True, "command": str(wrapper)})
+    info = u.info()
+    assert info["found"] is True and info["error"] is None and info["path"] == str(real)
+    assert info["command"] == f"sudo -n {real}"  # sudo stays in front
+    u.update({"sudo": False, "command": str(wrapper)})
+    assert asyncio.run(u.usbip("port")) == (0, "usbip (usbip-utils 2.0) port")

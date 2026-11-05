@@ -8,6 +8,7 @@ import hashlib
 import os
 import ssl as _ssl
 import time
+import urllib.parse
 from typing import Any
 
 import aiohttp
@@ -59,14 +60,17 @@ class AgentClient:
         transport = setup.get("transport") or ("tls" if setup.get("tls") else "auto")
         self.transport = transport
         self.mode: str | None = None
-        if self.fingerprint or transport == "tls" or setup.get("verify_tls"):
+        self._ssl_param: Any = None
+        if self.fingerprint or setup.get("verify_tls"):
             self.mode = "tls"
         elif transport == "plain":
             self.mode = "plain"
         else:
+            # No pin yet (also with transport "tls"): the first connection probes and pins the
+            # certificate. A cached "tls" without a pin would skip that and verify nothing.
             hit = self.cache.get(setup.get("id", ""))
-            if hit and (hit[0] == "tls" or time.time() - hit[1] < PLAIN_RECHECK):
-                self.mode = hit[0]
+            if hit and hit[0] == "plain" and time.time() - hit[1] < PLAIN_RECHECK:
+                self.mode = "plain"
 
     @property
     def encrypted(self) -> bool:
@@ -85,7 +89,9 @@ class AgentClient:
         if self.mode != "tls":
             return True  # not used for http:// URLs
         if self.fingerprint:
-            return aiohttp.Fingerprint(bytes.fromhex(self.fingerprint))
+            if self._ssl_param is None:  # one object: aiohttp pools connections by it
+                self._ssl_param = aiohttp.Fingerprint(bytes.fromhex(self.fingerprint))
+            return self._ssl_param
         if self.setup.get("verify_tls"):
             return True  # a certificate from a real CA
         return False
@@ -102,12 +108,18 @@ class AgentClient:
         ctx = _ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = _ssl.CERT_NONE
+        host = self.setup["host"].strip("[]")
+        where = f"{self.setup['name']} ({self.setup['host']}:{self.port})"
         try:
-            _r, w = await asyncio.wait_for(asyncio.open_connection(self.setup["host"], self.port, ssl=ctx), 6)
-        except _ssl.SSLError:
-            self.mode = "plain"  # it answered, but not with TLS: an agent before version 0.4
+            _r, w = await asyncio.wait_for(asyncio.open_connection(host, self.port, ssl=ctx), 6)
+        except _ssl.SSLError as e:
+            # It answered, but not with TLS: an agent before version 0.4? Make sure that it speaks
+            # plain HTTP before we trust that (a broken handshake must not turn encryption off).
+            if not await self._answers_http(host):
+                raise AgentError(f"TLS handshake with {where} failed: {e}") from None
+            self.mode = "plain"
         except (OSError, asyncio.TimeoutError) as e:
-            raise AgentError(f"cannot reach {self.setup['name']} ({self.setup['host']}:{self.port}): {e}") from None
+            raise AgentError(f"cannot reach {where}: {e}") from None
         else:
             der = w.get_extra_info("ssl_object").getpeercert(binary_form=True)
             w.close()
@@ -116,10 +128,26 @@ class AgentClient:
             except (OSError, asyncio.TimeoutError, _ssl.SSLError):
                 pass
             self.fingerprint = fingerprint_of(der)
+            self._ssl_param = None
             self.mode = "tls"
             if self.on_pin:
                 self.on_pin(self.fingerprint)
         self.cache[self.setup.get("id", "")] = (self.mode, time.time())
+
+    async def _answers_http(self, host: str) -> bool:
+        try:
+            r, w = await asyncio.wait_for(asyncio.open_connection(host, self.port), 6)
+        except (OSError, asyncio.TimeoutError):
+            return False
+        try:
+            w.write(b"GET /api/ping HTTP/1.0\r\nHost: %s\r\n\r\n" % host.encode("ascii", "ignore"))
+            await w.drain()
+            head = await asyncio.wait_for(r.read(5), 6)
+            return head == b"HTTP/"
+        except (OSError, asyncio.TimeoutError):
+            return False
+        finally:
+            w.close()
 
     @property
     def headers(self) -> dict[str, str]:
@@ -166,8 +194,15 @@ class AgentClient:
     async def usb(self, include_hubs: bool = False) -> dict:
         return await self.request("GET", "/api/usb", params={"all": "1"} if include_hubs else None, timeout=8)
 
-    async def bind(self, busid: str, force: bool = False) -> dict:
-        return await self.request("POST", "/api/usb/bind", {"busid": busid, "force": force}, timeout=30)
+    async def bind(self, busid: str, force: bool = False, restore_owner: bool = False) -> dict:
+        body: dict[str, Any] = {"busid": busid, "force": force}
+        if restore_owner:
+            body["restore_owner"] = True
+        return await self.request("POST", "/api/usb/bind", body, timeout=30)
+
+    async def usbip_allow(self, busid: str) -> dict:
+        """Plain USB/IP: the agent lets this PC's IP connect to usbipd for a short time."""
+        return await self.request("POST", "/api/usb/allow", {"busid": busid}, timeout=15)
 
     async def unbind(self, busid: str) -> dict:
         return await self.request("POST", "/api/usb/unbind", {"busid": busid}, timeout=30)
@@ -219,14 +254,28 @@ class AgentClient:
                 async with self.session.put(self.base + "/api/files", params={"path": remote_path}, data=f,
                                             headers=dict(self.headers, **{"Content-Length": str(size)}),
                                             ssl=self.ssl, timeout=aiohttp.ClientTimeout(total=600)) as r:
-                    data = await r.json(content_type=None)
                     if r.status >= 400:
-                        raise AgentError(data.get("error") or f"HTTP {r.status}", r.status)
-                    return data
+                        raise AgentError(await self._error_text(r), r.status)
+                    return await r.json(content_type=None)
         except aiohttp.ServerFingerprintMismatch:
             raise AgentError(self.mismatch_message(), 495) from None
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
             raise AgentError(f"upload to {self.setup['name']} failed: {e}") from None
+
+    @staticmethod
+    async def _error_text(r: aiohttp.ClientResponse) -> str:
+        """The "error" of a JSON answer, else the text of the body (an HTML error page, a proxy)."""
+        try:
+            data = await r.json(content_type=None)
+        except (ValueError, aiohttp.ContentTypeError):
+            data = None
+        if isinstance(data, dict) and data.get("error"):
+            return str(data["error"])
+        try:
+            text = (await r.text()).strip()
+        except (aiohttp.ClientError, UnicodeDecodeError):
+            text = ""
+        return f"HTTP {r.status}" + (f": {text[:300]}" if text and not text.startswith("<") else "")
 
     async def download(self, remote_path: str, local_path: str) -> dict:
         await self.ensure()
@@ -235,13 +284,21 @@ class AgentClient:
                                         headers=self.headers, ssl=self.ssl,
                                         timeout=aiohttp.ClientTimeout(total=600)) as r:
                 if r.status >= 400:
-                    data = await r.json(content_type=None)
-                    raise AgentError(data.get("error") or f"HTTP {r.status}", r.status)
+                    raise AgentError(await self._error_text(r), r.status)
                 size = 0
-                with open(local_path, "wb") as f:
-                    async for chunk in r.content.iter_chunked(1024 * 1024):
-                        f.write(chunk)
-                        size += len(chunk)
+                part = local_path + ".part"
+                try:
+                    with open(part, "wb") as f:
+                        async for chunk in r.content.iter_chunked(1024 * 1024):
+                            f.write(chunk)
+                            size += len(chunk)
+                    os.replace(part, local_path)
+                except BaseException:
+                    try:
+                        os.unlink(part)
+                    except OSError:
+                        pass
+                    raise
                 return {"path": local_path, "size": size}
         except aiohttp.ServerFingerprintMismatch:
             raise AgentError(self.mismatch_message(), 495) from None
@@ -288,5 +345,5 @@ class AgentClient:
     def shell_url(self, cols: int = 80, rows: int = 24, user: str | None = None) -> str:
         url = f"{self.ws_base}/api/shell?cols={int(cols)}&rows={int(rows)}"
         if user:
-            url += f"&user={user}"
+            url += "&user=" + urllib.parse.quote(user, safe="")
         return url
