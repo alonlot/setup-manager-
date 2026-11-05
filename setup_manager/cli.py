@@ -343,8 +343,8 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         install_args.append("--install-deps")
     if args.plain:
         install_args.append("--plain")
-    if args.open_usbip:
-        install_args.append("--open-usbip")
+    if args.usbip_mode:
+        install_args.append(args.usbip_mode)
     for rule in args.auto_bind or []:
         install_args += ["--auto-bind", rule]
     print(f">> copying agent to {target}")
@@ -547,7 +547,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--ssh-port", type=int)
     p.add_argument("--install-deps", action="store_true", help="install usbip with the package manager")
     p.add_argument("--plain", action="store_true", help="no TLS (NOT encrypted; TLS is the default)")
-    p.add_argument("--open-usbip", action="store_true", help="keep port 3240 open (USB/IP NOT encrypted)")
+    mode = p.add_mutually_exclusive_group()  # an update (rollout) keeps the mode you choose here
+    mode.add_argument("--open-usbip", dest="usbip_mode", action="store_const", const="--open-usbip",
+                      help="the default: usbip by hand works as without Setup Manager; any PC can attach a "
+                           "shared device")
+    mode.add_argument("--usbip-filter", dest="usbip_mode", action="store_const", const="--usbip-filter",
+                      help="a device that Setup Manager shares needs the token; devices shared by hand work for all")
+    mode.add_argument("--tunnel-only", dest="usbip_mode", action="store_const", const="--tunnel-only",
+                      help="USB/IP only through the encrypted tunnel")
     p.add_argument("--auto-bind", action="append", help="auto-bind rule, e.g. 0483:374b (repeatable)")
     p.add_argument("--no-add", action="store_true", help="do not add the setup to the manager config")
     p.set_defaults(fn=cmd_deploy)

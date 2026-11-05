@@ -87,13 +87,13 @@ DEFAULTS = {
     "tls_cert": "",
     "tls_key": "",
     "tls_dir": "",
-    # USB/IP from the network (with TLS):
-    #   "manual" (default) = the devices that Setup Manager shares go only through the encrypted tunnel
-    #            on the agent port; a device that you share by hand (`usbip bind` on this PC) also works
-    #            with plain `usbip attach -r THIS-PC` (port 3240 goes to a filter in the agent).
-    #   "tunnel" = only the encrypted tunnel: port 3240 is blocked from the network.
-    #   "open"   = port 3240 stays open for every device (not encrypted).
-    "usbip_network": "manual",
+    # USB/IP from the network (with TLS; the token always goes only over TLS):
+    #   "open" (default) = the agent does not touch port 3240: `usbip attach` by hand works as without
+    #            Setup Manager, also when the agent is stopped. Any PC can attach a shared device.
+    #   "manual" = a device that Setup Manager shares can be attached only by a PC that asked with the
+    #            token; a device that you share by hand works for everybody (a filter in the agent).
+    #   "tunnel" = only the encrypted tunnel on the agent port: port 3240 is blocked from the network.
+    "usbip_network": "open",
     "usbip_port": 3240,
     # The port of the filter for plain USB/IP ("manual"). Port 3240 from the network goes to it.
     "usbip_relay_port": 3241,
@@ -2065,6 +2065,10 @@ def usbip_firewall(block, port=3240, redirect_to=None):
             n = replaced + delete_all(tool, rule)
             done += ["%s: unblocked" % tool] * n
         done += _usbip_redirect(tool, port, redirect_to if block else None)
+        if not block:  # open: no rule of the agent on port 3240 at all
+            for table, chain in (("filter", "INPUT"), ("nat", "PREROUTING")):
+                _delete_with_comment(tool, table, chain, FW_COMMENT)
+                _delete_with_comment(tool, table, chain, FW_ALLOW)
     return done
 
 
@@ -3164,7 +3168,7 @@ def main(argv=None):
     else:
         server = Server((cfg["listen"], int(cfg["port"])), agent)
         log.warning("TLS is off: the API and the shell are not encrypted")
-    mode = str(cfg.get("usbip_network") or "manual").lower()
+    mode = str(cfg.get("usbip_network") or "open").lower()
     usbip_relay = None
     if use_tls and mode == "manual":
         try:

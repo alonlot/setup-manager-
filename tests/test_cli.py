@@ -60,3 +60,20 @@ def test_config_help_names_the_default(capsys):
         cli.main(["--help"])
     out = capsys.readouterr().out
     assert "setup-manager/config.json" in out and "None" not in out.split("--config")[1].split("\n")[0]
+
+
+@pytest.mark.parametrize("flag", ["--open-usbip", "--usbip-filter", "--tunnel-only"])
+def test_deploy_passes_the_usbip_mode(tmp_path, monkeypatch, flag):
+    got, rc = run_cli(monkeypatch, ["--config", str(tmp_path / "c.json"), "deploy", "dev@pc", flag], "cmd_deploy")
+    assert rc == 0 and got["usbip_mode"] == flag
+
+
+def test_deploy_usbip_modes_exclude_each_other(tmp_path, monkeypatch):
+    _, rc = run_cli(monkeypatch, ["--config", str(tmp_path / "c.json"), "deploy", "dev@pc", "--open-usbip",
+                                  "--tunnel-only"], "cmd_deploy")
+    assert rc == 2
+
+
+def test_the_agent_default_leaves_usbip_open():
+    from setup_manager.agent import setup_agent as sa
+    assert sa.DEFAULTS["usbip_network"] == "open"

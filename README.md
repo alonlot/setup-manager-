@@ -89,12 +89,13 @@ The installer:
 - Loads `usbip-host` at boot.
 - Sets the shell user to the user that ran sudo (`run_as`). Shells and commands run as this user, not root.
 - Makes a TLS certificate for this PC and prints its fingerprint as `CONFIG_FINGERPRINT=...`.
-- USB/IP from the network: a device that Setup Manager shares can be attached only by a PC that asked the agent first, with the token, over TLS. A device that you share by hand (`sudo usbip bind -b BUSID` on the setup PC) also works with plain `usbip attach -r SETUP-PC` from other PCs, as without Setup Manager (see [Devices shared by hand](#devices-shared-by-hand)).
-- Opens the agent port in ufw when ufw is active (8765/tcp, 8765/udp, and 3241/tcp for devices shared by hand).
+- Leaves USB/IP port 3240 as it is: `usbip bind` and `usbip attach` by hand work as without Setup Manager, also when the agent is stopped (see [USB/IP by hand](#usbip-by-hand)).
+- Opens the agent port and USB/IP in ufw when ufw is active (8765/tcp, 8765/udp, 3240/tcp).
 
 Options: `--token`, `--port`, `--run-as USER`, `--auto-bind RULE`, `--protect RULE`, `--install-deps`,
-`--plain` (no TLS: NOT encrypted), `--open-usbip` (port 3240 open for all devices: USB/IP NOT encrypted),
-`--tunnel-only` (USB/IP only through the encrypted tunnel: no plain USB/IP from the network at all).
+`--plain` (no TLS: the token goes in clear text), and one USB/IP mode (an update keeps the mode you chose):
+`--open-usbip` (the default), `--usbip-filter` (a device that Setup Manager shares needs the token), or
+`--tunnel-only` (USB/IP only through the encrypted tunnel).
 Run `install.sh` again to upgrade. It keeps the existing config. To remove: `sudo ./uninstall.sh [--purge]`.
 
 Check the agent on the setup PC: `systemctl status setup-agent` and `journalctl -u setup-agent -f`.
@@ -377,13 +378,13 @@ error "reserved by ci-42 until 12:30". Everybody can still read the serial port.
 - The reservation renews itself while your program runs. If the program dies, it ends after `ttl` seconds.
 - `wait=` waits for a board that somebody else has. Without it, you get `BoardBusy` at once.
 - A device that is not reserved works as before.
-- USB/IP itself has no locks. A device that is shared (bound) can be attached by a client that does not use Setup Manager: `usbip attach` on the setup PC itself, or from the network when the agent was installed with `--open-usbip`. Reserve a board before you share it.
+- USB/IP itself has no locks. A device that is shared (bound) can be attached by a client that does not use Setup Manager (in the default `open` mode, from any PC). Reserve a board before you share it, and use `--usbip-filter` if that matters.
 
 Reservations need agent 0.3.0 or newer: run `setup-manager deploy` again.
 
-### Devices shared by hand
+### USB/IP by hand
 
-You can still use plain USB/IP without Setup Manager. On the setup PC, share a device by hand:
+Plain USB/IP works as without Setup Manager. On the setup PC, share a device by hand:
 
 ```bash
 sudo usbip bind -b 1-1.2
@@ -393,14 +394,26 @@ Then attach it from any PC, as usual:
 
 ```bash
 sudo usbip attach -r SETUP-PC -b 1-1.2
-usbip list -r SETUP-PC      # shows only the devices that are shared by hand
+usbip list -r SETUP-PC
 ```
 
-- The agent knows which devices Setup Manager shared (also after a restart). Only those need the token. The app says "shared by hand: plain usbip works" next to such a device (`shared_by` in `setup-manager usb --json`).
-- A device that you shared by hand stays "by hand" when Setup Manager unshares it for a short time (flash, identify).
-- When Setup Manager stops sharing a device and you share it by hand, it is "by hand" from then on.
-- A reserved device is refused, also when it was shared by hand.
-- In the agent config: `"usbip_network": "manual"` (the default), `"tunnel"` (`--tunnel-only`) or `"open"` (`--open-usbip`). The filter listens on `usbip_relay_port` (3241).
+By default (`"usbip_network": "open"`), the agent does not touch port 3240: no firewall rule, no filter.
+This also means that any PC that can reach port 3240 can attach any shared device, also a device that
+Setup Manager shared, without the token, and a reservation does not stop it. The token still protects
+everything else: shells, commands, bind and unbind through the agent, flash, serial, files and the config.
+
+Two other modes close this gap. Choose one with `setup-manager deploy ... --usbip-filter` (or
+`--tunnel-only`); an update (`setup-manager rollout`) keeps it.
+
+| Mode | A device that Setup Manager shares | A device that you share by hand | When the agent is stopped |
+|---|---|---|---|
+| `open` (default) | Any PC can attach it | Any PC can attach it | Works |
+| `manual` (`--usbip-filter`) | Only a PC that asked with the token | Any PC can attach it (through a filter in the agent, port 3241) | USB/IP from the network is refused |
+| `tunnel` (`--tunnel-only`) | Only through the encrypted tunnel | Only on the setup PC itself | USB/IP from the network is refused |
+
+With `--usbip-filter`: the agent knows which devices Setup Manager shared (also after a restart); the app says
+"shared by hand: plain usbip works" next to the other ones; a device stays "by hand" when Setup Manager
+unshares it for a short time (flash, identify); a reserved device is refused.
 
 ### pytest
 
@@ -583,8 +596,8 @@ After the update, close the app and open it again.
  your PC (app, CLI, MCP, Lab)                         setup PC
  TLS 1.2+ ──────────────────── TCP 8765 ────────────►  setup-agent
    - API, shell, serial, files: every request has the token
-   - USB/IP: "let me in" (POST /api/usb/allow, with the token) -> the agent opens port 3240
-     for the IP of your PC for 30 s
+   - USB/IP: "let me in" (POST /api/usb/allow, with the token); with --usbip-filter, the agent
+     then opens port 3240 for the IP of your PC for 30 s
  plain USB/IP ───────────────── TCP 3240 ───────────►  usbipd (the kernel does the USB/IP)
  UDP 8765 broadcast (Scan network only) ────────────►  name, port, version, fingerprint (no secrets)
  SSH (setup-manager deploy only) ──── TCP 22 ───────►  install / update the agent
@@ -601,7 +614,7 @@ then USB/IP goes through a tunnel in the TLS port ("SMTUNNEL <token>"), which is
 | The agent's identity | The app pins the SHA-256 fingerprint of the certificate, like SSH `known_hosts`. A different certificate is refused ("the TLS certificate of ... changed! This can be an attack"). |
 | The first connection | `setup-manager deploy` reads the fingerprint over SSH, so the first connection is also safe. When you add a setup by hand, type the `CONFIG_FINGERPRINT` from `install.sh` in the fingerprint field, or the app trusts the certificate at the first connection. |
 | Access | A random token for each PC (32 bytes), unless you choose to use one token for all PCs. Without the token, only the name and version are visible. |
-| USB/IP | Not encrypted (unless **Encrypt USB/IP** is on). A device that Setup Manager shares can be attached only from an IP that asked the agent with the token in the last 30 seconds (iptables rules `setup-agent-usbip-allow`); the connection stays after that. Other connections to port 3240 go to a filter in the agent (`setup-agent-usbip`): it lets through only the devices that you shared by hand. Reservations apply to all of these. |
+| USB/IP | Not encrypted (unless **Encrypt USB/IP** is on), and the token never goes in it. Default (`open`): any PC can attach a shared device. With `--usbip-filter`: a device that Setup Manager shares can be attached only from an IP that asked the agent with the token in the last 30 seconds (iptables `setup-agent-usbip-allow`), other connections go to a filter in the agent that lets through only the devices shared by hand, and reservations apply. With `--tunnel-only`: only the encrypted tunnel. |
 | Downgrade | A setup with a pinned fingerprint never uses plain HTTP. |
 | Files | The tokens are in files with mode 600 on both sides. The key of the certificate is mode 600. |
 
@@ -619,9 +632,9 @@ fingerprint in **Edit setup**. To check a fingerprint: `setup-manager trust benc
 - All users of one token are the same user for the agent. The agent log does not show who did an action.
 - "In use by" names and reservations protect against mistakes, not against a person who has the token.
 - `setup-manager mcp --http` has no authentication. It listens on 127.0.0.1, so every user who can log in to your PC can use it. The stdio mode (the default) does not have this problem.
-- `--plain` and `--open-usbip` turn the encryption off. Use them only on a network that you trust completely.
-- A device that you share by hand is NOT encrypted and needs no token, like plain USB/IP without Setup Manager. Use `--tunnel-only` to turn this off.
-- The USB traffic of Setup Manager is not encrypted (the token is). Somebody on the network can read it, and a PC that has the same IP address as yours (behind the same NAT) can attach a device in the 30 seconds after you. Turn on **Encrypt USB/IP** if that matters on your network.
+- `--plain` sends the token in clear text. Use it only on a network that you trust completely.
+- In the default `open` mode, any PC on the network can attach a shared device without the token, like plain USB/IP without Setup Manager. Use `--usbip-filter` or `--tunnel-only` to stop that.
+- The USB traffic of Setup Manager is not encrypted (the token is). Somebody on the network can read it, and with `--usbip-filter`, a PC that has the same IP address as yours (behind the same NAT) can attach a device in the 30 seconds after you. Turn on **Encrypt USB/IP** if that matters on your network.
 
 ## Troubleshooting
 
@@ -632,8 +645,8 @@ fingerprint in **Edit setup**. To check a fingerprint: `setup-manager trust benc
 | "agent rejected the token" | The token in the app does not match `/etc/setup-agent/config.json`. |
 | "usbipd is not running" | Click **Start usbipd** in the banner, or `sudo systemctl restart setup-usbipd` on the setup PC. |
 | usbip not found on the setup PC, or bind fails with "usbip not found for kernel ..." | Ubuntu: `/usr/bin/usbip` is a wrapper that needs the tools of the running kernel (after a kernel update too): `sudo apt install linux-tools-$(uname -r)`. Without them, the agent uses the newest `/usr/lib/linux-tools/*/usbip` that it finds; the status shows the path and the hint. Debian: `sudo apt install usbip`. |
-| `usbip attach -r SETUP-PC` by hand fails with "Request Failed" | Setup Manager shared this device: it needs the token. Use `setup-manager attach SETUP BUSID`, or stop sharing it in the app and share it by hand (`sudo usbip bind -b BUSID` on the setup PC). |
-| `usbip attach -r SETUP-PC` by hand fails with "connection refused" | The agent was installed with `--tunnel-only`, or it is not running, or ufw blocks port 3241. Use `setup-manager attach SETUP BUSID`. |
+| `usbip attach -r SETUP-PC` by hand fails with "Request Failed" | The agent uses `--usbip-filter` and Setup Manager shared this device: it needs the token. Use `setup-manager attach SETUP BUSID`, or stop sharing it in the app and share it by hand (`sudo usbip bind -b BUSID` on the setup PC). |
+| `usbip attach -r SETUP-PC` by hand fails with "connection refused" | usbipd is not running, or a firewall blocks 3240/tcp. With `--usbip-filter`: the agent is not running, or ufw blocks port 3241. With `--tunnel-only`: normal, use `setup-manager attach SETUP BUSID`. To get the default back: `setup-manager deploy USER@HOST --open-usbip`. |
 | Attach fails with "password is required" | Run `./install-app.sh` again (it adds the sudo rule). |
 | Attach fails with "open vhci_driver" | `sudo modprobe vhci-hcd` on your PC. |
 | Attach times out or is refused | A firewall between the PCs blocks port 3240/tcp: open it, or turn on **Encrypt USB/IP** (USB/IP then goes through port 8765). |
