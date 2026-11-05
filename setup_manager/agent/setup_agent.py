@@ -13,7 +13,7 @@ API (all routes except /api/ping need "Authorization: Bearer <token>"):
   GET  /api/ping                     name, version (no auth)
   GET  /api/status                   PC status
   GET  /api/usb[?all=1]              USB devices (all=1 also shows hubs)
-  POST /api/usb/bind    {busid, force}
+  POST /api/usb/bind    {busid, force, restore_owner}
   POST /api/usb/unbind  {busid}
   POST /api/usb/reset   {busid}
   POST /api/usb/identify {busid, reset, baud, duration, script, after_script, tty, user}
@@ -86,10 +86,16 @@ DEFAULTS = {
     "tls_cert": "",
     "tls_key": "",
     "tls_dir": "",
-    # USB/IP: "tunnel" (default with TLS) = port 3240 is blocked from the network, USB/IP works only
-    # through the encrypted tunnel on the agent port. "open" = port 3240 stays open (not encrypted).
-    "usbip_network": "tunnel",
+    # USB/IP from the network (with TLS):
+    #   "manual" (default) = the devices that Setup Manager shares go only through the encrypted tunnel
+    #            on the agent port; a device that you share by hand (`usbip bind` on this PC) also works
+    #            with plain `usbip attach -r THIS-PC` (port 3240 goes to a filter in the agent).
+    #   "tunnel" = only the encrypted tunnel: port 3240 is blocked from the network.
+    #   "open"   = port 3240 stays open for every device (not encrypted).
+    "usbip_network": "manual",
     "usbip_port": 3240,
+    # The port of the filter for plain USB/IP ("manual"). Port 3240 from the network goes to it.
+    "usbip_relay_port": 3241,
     # User for shells and commands. Empty = the user the agent runs as (root).
     "run_as": "",
     "shell": "/bin/bash",
@@ -326,6 +332,54 @@ class UsbManager:
         self.lock = threading.Lock()
         self._usbip = None  # (argv, ok, error, time) of resolve_tool
         self._usbip_lock = threading.Lock()
+        # The devices that Setup Manager shared (busid -> device rule). Kept in a file, so that an
+        # agent restart does not make them available without encryption.
+        self.shared_path = cfg.get("shared_state_file") or os.path.join(
+            os.path.dirname(os.path.abspath(cfg.get("files_dir") or "/var/lib/setup-agent/files")),
+            "shared-by-manager.json")
+        self.shared_lock = threading.Lock()
+        self.shared = self._load_shared()
+        self.unbound_owner = {}  # busid -> (who had shared it, device rule): for bind(restore_owner=True)
+
+    # -- who shared a device: Setup Manager, or somebody by hand --------------
+    def _load_shared(self):
+        try:
+            with open(self.shared_path) as f:
+                data = json.load(f)
+            return dict((str(k), str(v)) for k, v in data.items()) if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_shared(self):
+        folder = os.path.dirname(self.shared_path)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".shared.", dir=folder)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.shared, f)
+            os.replace(tmp, self.shared_path)
+        except OSError as e:
+            log.warning("cannot save %s: %s", self.shared_path, e)
+
+    def mark_shared(self, dev, on):
+        with self.shared_lock:
+            if on:
+                self.shared[dev["busid"]] = device_rule(dev).lower()
+            elif self.shared.pop(dev["busid"], None) is None:
+                return
+            self._save_shared()
+
+    def shared_by_manager(self, dev):
+        """True when Setup Manager shared this device (it is bound and it is the same device)."""
+        with self.shared_lock:
+            rule = self.shared.get(dev["busid"])
+            if rule is None:
+                return False
+            if not dev["bound"]:  # unshared (or unplugged): the next bind decides again
+                self.shared.pop(dev["busid"], None)
+                self._save_shared()
+                return False
+            return rule == device_rule(dev).lower()
 
     # -- usbip / usbipd ------------------------------------------------------
     def _tools_dirs(self):
@@ -537,6 +591,8 @@ class UsbManager:
             dev = self._device(e, entries)
             if dev is None or (dev["is_hub"] and not include_hubs):
                 continue
+            shared = self.shared_by_manager(dev)
+            dev["shared_by"] = ("setup-manager" if shared else "hand") if dev["bound"] else None
             devices.append(dev)
         devices.sort(key=lambda d: busid_key(d["busid"]))
         return devices
@@ -556,7 +612,9 @@ class UsbManager:
         return dev
 
     # -- actions ---------------------------------------------------------------
-    def bind(self, busid, force=False):
+    def bind(self, busid, force=False, restore_owner=False):
+        """Share a device. restore_owner: it was unbound for a moment (flash, identify): a device that
+        was shared by hand stays "by hand" (plain USB/IP from the network keeps working for it)."""
         with self.lock:
             dev = self.get(busid)
             if dev["bound"]:
@@ -573,6 +631,9 @@ class UsbManager:
             dev = self.get(busid)
             if not dev["bound"]:
                 raise ApiError(500, "usbip bind failed (rc=%d): %s" % (rc, out))
+            before = self.unbound_owner.pop(busid, None)
+            if not (restore_owner and before == ("hand", device_rule(dev).lower())):
+                self.mark_shared(dev, True)  # (a device that was already bound by hand stays "by hand")
             log.info("bound %s (%s)", busid, dev["name"])
             return {"device": dev, "message": out}
 
@@ -581,10 +642,13 @@ class UsbManager:
             dev = self.get(busid)
             if not dev["bound"]:
                 return {"device": dev, "message": "not bound"}
+            self.unbound_owner[busid] = ("setup-manager" if self.shared_by_manager(dev) else "hand",
+                                         device_rule(dev).lower())
             rc, out = self.usbip("unbind", "-b", busid)
             dev = self.get(busid)
             if dev["bound"]:
                 raise ApiError(500, "usbip unbind failed (rc=%d): %s" % (rc, out))
+            self.mark_shared(dev, False)
             log.info("unbound %s (%s)", busid, dev["name"])
             return {"device": dev, "message": out}
 
@@ -1786,14 +1850,128 @@ class TlsFront:
             a.tunnels.pop(tid, None)
 
 
+OP_REQ_DEVLIST = 0x8005
+OP_REP_IMPORT = 0x0003
+USBIP_ST_NA = 0x01  # "Request Failed" in the usbip client
+USBIP_DEVICE_SIZE = 312  # struct usbip_usb_device; bNumInterfaces is its last byte
+
+
+class UsbipRelay:
+    """Plain USB/IP from the network, for the devices that were shared by hand ("usbip_network": "manual").
+
+    iptables sends port 3240 from the network here. The agent reads the first USB/IP request: an
+    import of a device that Setup Manager shared (or that is reserved) is refused, everything else is
+    relayed to usbipd. `usbip list -r` shows only the devices that can be attached in this way.
+    """
+
+    def __init__(self, agent, port):
+        self.agent = agent
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)  # IPv4 too
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("::", int(port)))
+        except OSError:
+            if sock is not None:
+                sock.close()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("0.0.0.0", int(port)))
+            except OSError:
+                sock.close()
+                raise
+        sock.listen(64)
+        self.sock = sock
+        self.port = sock.getsockname()[1]
+
+    def serve(self):
+        while True:
+            try:
+                conn, addr = self.sock.accept()
+            except OSError as e:
+                if self.sock.fileno() < 0:
+                    return
+                log.warning("USB/IP relay accept failed: %s", e)
+                time.sleep(0.1)
+                continue
+            threading.Thread(target=self._handle, args=(conn, addr), name="usbip-relay", daemon=True).start()
+
+    @staticmethod
+    def _recv_at_least(conn, data, n):
+        while len(data) < n:
+            more = conn.recv(4096)
+            if not more:
+                raise EOFError("closed before the USB/IP request")
+            data += more
+        return data
+
+    def _handle(self, conn, addr):
+        ip = addr[0][7:] if addr[0].startswith("::ffff:") else addr[0]
+        try:
+            conn.settimeout(10)
+            self._handle_inner(conn, ip)
+        except (OSError, EOFError, ValueError, struct.error) as e:
+            log.debug("plain USB/IP from %s ended: %s", ip, e)
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _usbipd(self):
+        return socket.create_connection(("127.0.0.1", int(self.agent.cfg.get("usbip_port") or 3240)), timeout=10)
+
+    def _handle_inner(self, conn, ip):
+        a = self.agent
+        data = self._recv_at_least(conn, b"", 8)
+        version, code = struct.unpack("!HH", data[:4])
+        if code == OP_REQ_IMPORT:
+            data = self._recv_at_least(conn, data, 40)
+            busid = data[8:40].split(b"\0", 1)[0].decode(errors="replace")
+            why = a.plain_usbip_refusal(busid)
+            if why:
+                log.warning("plain USB/IP from %s for %s refused: %s", ip, busid, why)
+                conn.sendall(struct.pack("!HHI", version, OP_REP_IMPORT, USBIP_ST_NA))
+                conn.close()
+                return
+            back = self._usbipd()
+            tid = id(back)
+            a.tunnels[tid] = {"ip": ip, "busid": busid, "at": time.time(), "source": "usbip"}
+            log.info("plain USB/IP from %s for %s (shared by hand)", ip, busid)
+            try:
+                relay(conn, back, data)
+            finally:
+                a.tunnels.pop(tid, None)
+        elif code == OP_REQ_DEVLIST:
+            back = self._usbipd()
+            try:
+                back.settimeout(10)
+                back.sendall(data[:8])
+                reply = b""
+                while len(reply) < 4 * 1024 * 1024:
+                    more = back.recv(65536)
+                    if not more:
+                        break
+                    reply += more
+            finally:
+                back.close()
+            conn.sendall(a.filter_devlist(reply))
+            conn.close()
+        else:
+            conn.close()
+
+
 FW_COMMENT = "setup-agent-usbip"
 
 
-def usbip_firewall(block, port=3240):
+def usbip_firewall(block, port=3240, redirect_to=None):
     """Block (or unblock) USB/IP from the network, so that it works only through the encrypted tunnel.
 
     The rule refuses the connection (TCP reset): a `usbip attach` by hand from another PC fails at
     once with "connection refused", instead of hanging for two minutes (older agents used DROP).
+    With redirect_to (a port), port `port` from the network goes to that port instead (the filter
+    for plain USB/IP of devices shared by hand); the block stays as a safety net.
     """
     done = []
     match = ["INPUT", "-p", "tcp", "--dport", str(port), "!", "-i", "lo", "-m", "comment", "--comment", FW_COMMENT]
@@ -1818,7 +1996,34 @@ def usbip_firewall(block, port=3240):
         else:
             n = replaced + delete_all(tool, rule)
             done += ["%s: unblocked" % tool] * n
+        done += _usbip_redirect(tool, port, redirect_to if block else None)
     return done
+
+
+def _usbip_redirect(tool, port, to_port):
+    """The nat rule that sends port `port` from the network to `to_port` (None: remove it)."""
+    notes = []
+    want = None
+    if to_port:
+        want = ["PREROUTING", "-p", "tcp", "--dport", str(port), "!", "-i", "lo", "-m", "comment",
+                "--comment", FW_COMMENT, "-j", "REDIRECT", "--to-ports", str(to_port)]
+    p = subprocess.run([tool, "-t", "nat", "-S", "PREROUTING"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    have = False
+    for line in p.stdout.decode(errors="replace").splitlines():
+        if FW_COMMENT not in line or not line.startswith("-A "):
+            continue
+        args = shlex.split(line)
+        if want and args[-2:] == ["--to-ports", str(to_port)]:
+            have = True
+            continue
+        subprocess.run([tool, "-t", "nat", "-D"] + args[1:], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if want and not have:
+        r = subprocess.run([tool, "-t", "nat", "-I"] + want, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        notes.append("%s: %s" % (tool, "port %d from the network goes to the filter for devices shared by hand "
+                                       "(port %s)" % (port, to_port) if r.returncode == 0 else
+                                 "cannot redirect port %d (only the encrypted tunnel works): %s"
+                                 % (port, r.stdout.decode(errors="replace").strip())))
+    return notes
 
 
 class WebSocket:
@@ -2045,6 +2250,7 @@ class Agent:
         self.reservations = {}
         self.tunnels = {}
         self.tls_fingerprint = None
+        self.usbip_relay_port = None  # the filter for plain USB/IP of devices shared by hand
         self.res_lock = threading.Lock()
 
     # -- API handlers ----------------------------------------------------------
@@ -2087,8 +2293,17 @@ class Agent:
             "tls": bool(self.tls_fingerprint),
             "tunnel": bool(self.tls_fingerprint),
             "fingerprint": self.tls_fingerprint,
+            # USB/IP from the network: "manual" (devices shared by hand also work with plain usbip),
+            # "tunnel" (only the encrypted tunnel) or "open".
+            "usbip_network": self.usbip_network(),
+            "usbip_relay_port": self.usbip_relay_port,
             "time": time.time(),
         }
+
+    def usbip_network(self):
+        if not self.tls_fingerprint or str(self.cfg.get("usbip_network")).lower() == "open":
+            return "open"
+        return "manual" if self.usbip_relay_port else "tunnel"
 
     def usb_list(self, qs):
         include_hubs = qs.get("all", ["0"])[0] in ("1", "true", "yes")
@@ -2116,7 +2331,7 @@ class Agent:
             if c:
                 d["used_by"] = dict(c, source="claim", connected=c["ip"] in ips if ips else None)
             elif t:
-                d["used_by"] = {"ip": t["ip"], "host": reverse_name(t["ip"]), "source": "tunnel"}
+                d["used_by"] = {"ip": t["ip"], "host": reverse_name(t["ip"]), "source": t.get("source", "tunnel")}
             elif len(others) == 1:
                 d["used_by"] = {"ip": others[0], "host": reverse_name(others[0]), "source": "tcp"}
             elif others:
@@ -2210,6 +2425,42 @@ class Agent:
         if r and not any(hmac.compare_digest(x, r["lease"]) for x in leases):
             raise ApiError(423, "%s is reserved by %s until %s" % (
                 busid, r["owner"], time.strftime("%H:%M:%S", time.localtime(r["expires"]))))
+
+    def plain_usbip_refusal(self, busid):
+        """Why a plain USB/IP client (no token) cannot use this device, or None when it can."""
+        try:
+            dev = self.usb.get(busid)
+        except ApiError:
+            return None  # usbipd answers "no such device"
+        if dev["bound"] and self.usb.shared_by_manager(dev):
+            return ("shared by Setup Manager: it is available only through the encrypted tunnel "
+                    "(setup-manager attach)")
+        try:
+            self.check_lease(busid, [])
+        except ApiError as e:
+            return e.message
+        return None
+
+    def filter_devlist(self, reply):
+        """Keep in an OP_REP_DEVLIST only the devices that a plain USB/IP client may attach."""
+        if len(reply) < 12:
+            return reply
+        empty = reply[:8] + struct.pack("!I", 0)
+        try:
+            n = struct.unpack("!I", reply[8:12])[0]
+            pos, kept = 12, []
+            for _ in range(n):
+                head = reply[pos:pos + USBIP_DEVICE_SIZE]
+                if len(head) < USBIP_DEVICE_SIZE:
+                    return empty
+                size = USBIP_DEVICE_SIZE + 4 * bytearray(head)[USBIP_DEVICE_SIZE - 1]
+                busid = head[256:288].split(b"\0", 1)[0].decode(errors="replace")
+                if self.plain_usbip_refusal(busid) is None:
+                    kept.append(reply[pos:pos + size])
+                pos += size
+        except (struct.error, IndexError):
+            return empty
+        return reply[:8] + struct.pack("!I", len(kept)) + b"".join(kept)
 
     def busid_for_tty(self, tty):
         tty = os.path.basename(str(tty or ""))
@@ -2657,7 +2908,8 @@ class Handler(BaseHTTPRequestHandler):
             routes = {
                 ("GET", "/api/status"): lambda: a.status(),
                 ("GET", "/api/usb"): lambda: a.usb_list(qs),
-                ("POST", "/api/usb/bind"): lambda: a.usb.bind(body.get("busid"), bool(body.get("force"))),
+                ("POST", "/api/usb/bind"): lambda: a.usb.bind(body.get("busid"), bool(body.get("force")),
+                                                              bool(body.get("restore_owner"))),
                 ("POST", "/api/usb/unbind"): lambda: a.usb.unbind(body.get("busid")),
                 ("POST", "/api/usb/reset"): lambda: a.usb.reset(body.get("busid")),
                 ("POST", "/api/usb/identify"): lambda: a.identify(body),
@@ -2811,9 +3063,20 @@ def main(argv=None):
     else:
         server = Server((cfg["listen"], int(cfg["port"])), agent)
         log.warning("TLS is off: the API and the shell are not encrypted")
+    mode = str(cfg.get("usbip_network") or "manual").lower()
+    usbip_relay = None
+    if use_tls and mode == "manual":
+        try:
+            usbip_relay = UsbipRelay(agent, int(cfg.get("usbip_relay_port") or 3241))
+            threading.Thread(target=usbip_relay.serve, name="usbip-relay", daemon=True).start()
+        except OSError as e:
+            log.warning("cannot listen on port %s for plain USB/IP: %s. Devices shared by hand are not "
+                        "available from the network (only the encrypted tunnel works).",
+                        cfg.get("usbip_relay_port") or 3241, e)
+    agent.usbip_relay_port = usbip_relay.port if usbip_relay else None
     if os.geteuid() == 0:
-        block = bool(use_tls) and cfg.get("usbip_network", "tunnel") == "tunnel"
-        for note in usbip_firewall(block, int(cfg.get("usbip_port") or 3240)):
+        block = bool(use_tls) and mode != "open"
+        for note in usbip_firewall(block, int(cfg.get("usbip_port") or 3240), agent.usbip_relay_port):
             log.info("USB/IP port: %s", note)
 
     if os.geteuid() == 0:

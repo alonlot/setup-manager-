@@ -3,13 +3,13 @@
 #
 #   sudo ./install.sh [--name NAME] [--token TOKEN] [--port 8765] [--run-as USER]
 #                     [--auto-bind RULE]... [--protect RULE]... [--install-deps]
-#                     [--plain] [--open-usbip]
+#                     [--plain] [--open-usbip | --tunnel-only]
 #
 # TLS is on by default: a self-signed certificate is made in /etc/setup-agent, and its
-# fingerprint is printed (CONFIG_FINGERPRINT=...). USB/IP goes through the encrypted
-# agent port, and port 3240 is blocked from the network. --plain turns TLS off (not
-# encrypted). --open-usbip keeps port 3240 open (USB/IP not encrypted).
-#
+# fingerprint is printed (CONFIG_FINGERPRINT=...). The devices that Setup Manager shares go
+# only through the encrypted agent port. A device that you share by hand (usbip bind on this
+# PC) also works with plain usbip from the network. --tunnel-only: not that either.
+# --open-usbip: plain usbip for all devices. --plain turns TLS off. (Both: NOT encrypted.)
 # An existing /etc/setup-agent/config.json is kept. Options given on the
 # command line replace the values in it.
 set -euo pipefail
@@ -19,7 +19,7 @@ PREFIX=/opt/setup-agent
 CONF_DIR=/etc/setup-agent
 CONF="$CONF_DIR/config.json"
 
-NAME="" TOKEN="" PORT="" RUN_AS="${SUDO_USER:-}" RUN_AS_GIVEN=0 TLS=1 DEPS=0 OPEN_USBIP=0
+NAME="" TOKEN="" PORT="" RUN_AS="${SUDO_USER:-}" RUN_AS_GIVEN=0 TLS=1 DEPS=0 OPEN_USBIP=0 TUNNEL_ONLY=0
 AUTO_BIND=() PROTECT=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,6 +32,7 @@ while [[ $# -gt 0 ]]; do
     --tls) TLS=1; shift;;
     --plain) TLS=0; shift;;
     --open-usbip) OPEN_USBIP=1; shift;;
+    --tunnel-only) TUNNEL_ONLY=1; shift;;
     --install-deps) DEPS=1; shift;;
     -h|--help) sed -n '2,14p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; exit 1;;
@@ -106,7 +107,7 @@ AUTO_JSON="$(printf '%s\n' "${AUTO_BIND[@]+"${AUTO_BIND[@]}"}")" \
 PROTECT_JSON="$(printf '%s\n' "${PROTECT[@]+"${PROTECT[@]}"}")" \
 NAME="$NAME" TOKEN="$TOKEN" PORT="$PORT" RUN_AS="$RUN_AS" RUN_AS_GIVEN="$RUN_AS_GIVEN" TLS="$TLS" \
 CONF="$CONF" CONF_DIR="$CONF_DIR" \
-OPEN_USBIP="$OPEN_USBIP" \
+OPEN_USBIP="$OPEN_USBIP" TUNNEL_ONLY="$TUNNEL_ONLY" \
 python3 - <<'PY'
 import json, os, secrets, socket
 conf = os.environ["CONF"]
@@ -135,7 +136,12 @@ if env["TLS"] == "1":
         cfg["tls_key"] = os.path.join(env["CONF_DIR"], "key.pem")
 else:
     cfg["tls"] = False
-cfg["usbip_network"] = "open" if env["OPEN_USBIP"] == "1" or env["TLS"] != "1" else "tunnel"
+if env["OPEN_USBIP"] == "1" or env["TLS"] != "1":
+    cfg["usbip_network"] = "open"
+elif env["TUNNEL_ONLY"] == "1":
+    cfg["usbip_network"] = "tunnel"
+else:
+    cfg["usbip_network"] = "manual"  # the devices shared by hand also work with plain usbip
 tmp = conf + ".tmp"
 with open(tmp, "w") as f:
     json.dump(cfg, f, indent=2)
@@ -179,7 +185,16 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active
     echo ">> opened ufw ports $PORT_NOW/tcp, $PORT_NOW/udp, 3240/tcp (USB/IP NOT encrypted)"
   else
     ufw delete allow 3240/tcp >/dev/null 2>&1 || true
-    echo ">> opened ufw ports $PORT_NOW/tcp, $PORT_NOW/udp (USB/IP goes through the encrypted agent port)"
+    MODE_NOW="$(python3 -c "import json;print(json.load(open('$CONF')).get('usbip_network','manual'))")"
+    RELAY_NOW="$(python3 -c "import json;print(json.load(open('$CONF')).get('usbip_relay_port',3241))")"
+    if [[ "$MODE_NOW" == "manual" ]]; then
+      # iptables sends port 3240 from the network to the agent's filter on this port.
+      ufw allow "$RELAY_NOW/tcp" >/dev/null
+      echo ">> opened ufw ports $PORT_NOW/tcp, $PORT_NOW/udp, $RELAY_NOW/tcp (plain usbip only for devices shared by hand)"
+    else
+      ufw delete allow "$RELAY_NOW/tcp" >/dev/null 2>&1 || true
+      echo ">> opened ufw ports $PORT_NOW/tcp, $PORT_NOW/udp (USB/IP goes through the encrypted agent port)"
+    fi
   fi
 fi
 

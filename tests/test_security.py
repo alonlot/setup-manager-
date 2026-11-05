@@ -5,13 +5,15 @@ import json
 import os
 import socket
 import ssl
+import struct
+import subprocess
 import sys
 import threading
 import urllib.request
 
 import pytest
 
-from conftest import FAKES, TOKEN, insecure_ctx, start_agent, stop_agent
+from conftest import FAKES, TOKEN, agent_url, free_port, insecure_ctx, start_agent, stop_agent
 from setup_manager.config import ConfigStore
 from setup_manager.fleet import Fleet, FleetError
 
@@ -283,3 +285,151 @@ def test_tls_setup_without_a_pin_is_pinned_on_the_first_connection(manager_confi
             await f.refresh("bench")
             assert ConfigStore(manager_config).get_setup("bench")["fingerprint"] == cert_fp(agent)
     run(go())
+
+
+# --------------------------------------------------------------------------- plain usbip for devices shared by hand
+
+def _api(agent, method, path, body=None):
+    req = urllib.request.Request(agent_url(agent, path), method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, context=insecure_ctx(), timeout=10) as r:
+        return json.loads(r.read())
+
+
+def _plain_usbip(port, request):
+    """What a plain `usbip` client gets from the agent's filter (port 3240 from the network goes there)."""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+        s.sendall(request)
+        out = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                return out
+            out += chunk
+
+
+def _import(busid):
+    return struct.pack("!HHI", 0x0111, 0x8003, 0) + busid.encode().ljust(32, b"\0")
+
+
+def _devlist_busids(reply):
+    n = struct.unpack("!I", reply[8:12])[0]
+    out, pos = [], 12
+    for _ in range(n):
+        out.append(reply[pos + 256:pos + 288].split(b"\0", 1)[0].decode())
+        pos += 312 + 4 * reply[pos + 311]
+    return out
+
+
+def _bind_by_hand(sysfs, busid):
+    subprocess.run([sys.executable, str(FAKES / "fake_usbip_host.py"), "bind", "-b", busid], check=True,
+                   env=dict(os.environ, FAKE_SYSFS=str(sysfs)), stdout=subprocess.DEVNULL)
+
+
+def test_plain_usbip_works_for_devices_shared_by_hand(tmp_path, sysfs):
+    relay_port = free_port()
+    agent = start_agent(tmp_path, sysfs, usbip_network="manual", usbip_relay_port=relay_port)
+    try:
+        st = _api(agent, "GET", "/api/status")
+        assert st["usbip_network"] == "manual" and st["usbip_relay_port"] == relay_port
+        _api(agent, "POST", "/api/usb/bind", {"busid": "1-1"})  # shared by Setup Manager
+        _bind_by_hand(sysfs, "1-2")                                # `sudo usbip bind -b 1-2` on the setup PC
+        by = {d["busid"]: d["shared_by"] for d in _api(agent, "GET", "/api/usb")["devices"]}
+        assert by["1-1"] == "setup-manager" and by["1-2"] == "hand" and by["1-3"] is None
+        usbipd = agent["usbipd"]
+        usbipd.exported = ["1-1", "1-2"]
+
+        # `usbip attach -r SETUP-PC -b 1-2`: relayed to usbipd.
+        assert _plain_usbip(relay_port, _import("1-2")).endswith(b"IMPORTED")
+        assert usbipd.imports == ["1-2"]
+        # 1-1 was shared by Setup Manager: only the encrypted tunnel. usbip says "Request Failed".
+        assert _plain_usbip(relay_port, _import("1-1")) == struct.pack("!HHI", 0x0111, 0x0003, 1)
+        assert usbipd.imports == ["1-2"]
+        # `usbip list -r SETUP-PC` shows only the device shared by hand.
+        assert _devlist_busids(_plain_usbip(relay_port, struct.pack("!HHI", 0x0111, 0x8005, 0))) == ["1-2"]
+
+        # A flash or identify unbinds for a moment and binds again: "by hand" stays "by hand".
+        _api(agent, "POST", "/api/usb/unbind", {"busid": "1-2"})
+        _api(agent, "POST", "/api/usb/bind", {"busid": "1-2", "restore_owner": True})
+        assert _plain_usbip(relay_port, _import("1-2")).endswith(b"IMPORTED")
+        # A device that is reserved is refused, also when it was shared by hand.
+        r = _api(agent, "POST", "/api/reserve", {"busid": "1-2", "owner": "ci", "ttl": 60})
+        assert _plain_usbip(relay_port, _import("1-2")) == struct.pack("!HHI", 0x0111, 0x0003, 1)
+        _api(agent, "POST", "/api/release", {"busid": "1-2", "lease": r["lease"]})
+    finally:
+        stop_agent(agent)
+
+    # An agent restart does not make the device of Setup Manager available without encryption.
+    agent = start_agent(tmp_path, sysfs, usbip_network="manual", usbip_relay_port=relay_port)
+    try:
+        assert _plain_usbip(relay_port, _import("1-1")) == struct.pack("!HHI", 0x0111, 0x0003, 1)
+        assert _plain_usbip(relay_port, _import("1-2")).endswith(b"IMPORTED")
+        # Setup Manager stops sharing 1-1, then you share it by hand: now plain usbip works for it.
+        _api(agent, "POST", "/api/usb/unbind", {"busid": "1-1"})
+        _bind_by_hand(sysfs, "1-1")
+        assert _plain_usbip(relay_port, _import("1-1")).endswith(b"IMPORTED")
+    finally:
+        stop_agent(agent)
+
+
+def test_tunnel_only_has_no_plain_usbip(tmp_path, sysfs):
+    relay_port = free_port()
+    agent = start_agent(tmp_path, sysfs, usbip_network="tunnel", usbip_relay_port=relay_port)
+    try:
+        assert _api(agent, "GET", "/api/status")["usbip_network"] == "tunnel"
+        with pytest.raises(OSError):
+            socket.create_connection(("127.0.0.1", relay_port), timeout=2).close()
+    finally:
+        stop_agent(agent)
+
+
+def test_firewall_redirects_port_3240_to_the_filter(tmp_path, monkeypatch):
+    from setup_manager.agent import setup_agent as sa
+    log = tmp_path / "calls.txt"
+    f = tmp_path / "iptables"
+    # -S lists a redirect of an older config (another port): it must go.
+    f.write_text(f'''#!/bin/sh
+echo "iptables $*" >> {log}
+case "$*" in
+  "-t nat -S PREROUTING") echo "-A PREROUTING -p tcp -m tcp --dport 3240 ! -i lo -m comment --comment setup-agent-usbip -j REDIRECT --to-ports 9999";;
+  -C*|"-t nat -C"*|-D*) exit 1;;
+esac
+exit 0
+''')
+    f.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+    notes = sa.usbip_firewall(True, 3240, redirect_to=3241)
+    calls = log.read_text().splitlines()
+    assert ("iptables -t nat -I PREROUTING -p tcp --dport 3240 ! -i lo -m comment --comment setup-agent-usbip "
+            "-j REDIRECT --to-ports 3241") in calls
+    assert ("iptables -t nat -D PREROUTING -p tcp -m tcp --dport 3240 ! -i lo -m comment --comment "
+            "setup-agent-usbip -j REDIRECT --to-ports 9999") in calls
+    assert any("goes to the filter" in n for n in notes)
+    # The block stays as a safety net (if the redirect is gone, nothing is open).
+    assert any(c.startswith("iptables -I INPUT") and "REJECT" in c for c in calls)
+    # Tunnel only: the redirect is removed.
+    log.write_text("")
+    sa.usbip_firewall(True, 3240, redirect_to=None)
+    assert any(c.startswith("iptables -t nat -D PREROUTING") for c in log.read_text().splitlines())
+
+
+def test_the_manager_says_when_a_device_was_shared_by_hand(tmp_path, sysfs):
+    agent = start_agent(tmp_path, sysfs, usbip_network="manual", usbip_relay_port=free_port())
+    cfg = tmp_path / "manager.json"
+    cfg.write_text(json.dumps({"local_usbip": {"command": [sys.executable, str(FAKES / "fake_usbip_client.py")],
+                                               "sudo": False},
+                               "setups": [{"id": "pc", "name": "PC", "host": "127.0.0.1", "port": agent["port"],
+                                           "token": TOKEN}]}))
+    try:
+        _bind_by_hand(sysfs, "1-2")
+
+        async def go():
+            async with Fleet(ConfigStore(cfg)) as f:
+                await f.bind("pc", "1-1")
+                return {d["busid"]: d["state_detail"] for d in await f.usb("pc")}
+        detail = run(go())
+        assert detail["1-2"].endswith("(shared by hand: plain usbip works)")
+        assert "by hand" not in detail["1-1"]
+    finally:
+        stop_agent(agent)

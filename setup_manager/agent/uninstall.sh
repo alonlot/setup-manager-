@@ -14,6 +14,9 @@ for t in iptables ip6tables; do  # the rule that blocks USB/IP from the network
     # shellcheck disable=SC2086
     while $t -D INPUT -p tcp --dport 3240 ! -i lo -m comment --comment setup-agent-usbip -j $target 2>/dev/null; do :; done
   done
+  # The redirect of port 3240 to the filter for devices shared by hand.
+  $t -t nat -S PREROUTING 2>/dev/null | grep -- "--comment setup-agent-usbip" | sed 's/^-A /-D /' |
+    while read -r rule; do eval "$t -t nat $rule" 2>/dev/null || true; done
 done
 [[ "${1:-}" == "--purge" ]] && rm -rf /etc/setup-agent
 echo "setup-agent removed"

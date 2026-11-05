@@ -332,6 +332,9 @@ class Fleet:
             else:
                 d["state_detail"] = {"available": "not shared", "bound": "shared, waiting for a client",
                                      "error": "usbip error"}.get(d["state"], d["state"])
+            if d.get("shared_by") == "hand" and not p:
+                # Shared with `usbip bind` on the setup PC: plain `usbip attach` from other PCs works too.
+                d["state_detail"] += " (shared by hand: plain usbip works)"
         entry = self.cache.setdefault(setup["id"], {})
         entry.update({"usb": devices, "online": True, "last_seen": time.time()})
         return devices
@@ -344,8 +347,10 @@ class Fleet:
         raise FleetError(f"no USB device {busid} on {setup['name']}", 404)
 
     # -- USB actions -----------------------------------------------------------
-    async def bind(self, ref: str, busid: str, force: bool = False) -> dict[str, Any]:
-        return await self._agent_call(self.client(ref).bind(busid, force))
+    async def bind(self, ref: str, busid: str, force: bool = False, restore_owner: bool = False) -> dict[str, Any]:
+        """Share a device. restore_owner: after a short unbind (flash, identify), a device that was shared
+        by hand on the setup PC stays "shared by hand" (plain usbip from other PCs keeps working)."""
+        return await self._agent_call(self.client(ref).bind(busid, force, restore_owner))
 
     async def unbind(self, ref: str, busid: str) -> dict[str, Any]:
         return await self._agent_call(self.client(ref).unbind(busid))
@@ -616,7 +621,7 @@ class Fleet:
             finally:
                 if was_bound:
                     try:
-                        await self.bind(setup["id"], busid)  # share it again, as it was
+                        await self.bind(setup["id"], busid, restore_owner=True)  # share it again, as it was
                     except FleetError as e:
                         log.warning("could not share %s again: %s", busid, e.message)
             where = setup["name"]
@@ -951,7 +956,7 @@ class Fleet:
             finally:
                 if was_bound:
                     try:
-                        await self.bind(setup["id"], busid)
+                        await self.bind(setup["id"], busid, restore_owner=True)
                     except FleetError as e:
                         log.warning("could not share %s again: %s", busid, e.message)
             where = setup["name"]

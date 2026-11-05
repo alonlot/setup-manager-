@@ -194,8 +194,11 @@ class AgentClient:
     async def usb(self, include_hubs: bool = False) -> dict:
         return await self.request("GET", "/api/usb", params={"all": "1"} if include_hubs else None, timeout=8)
 
-    async def bind(self, busid: str, force: bool = False) -> dict:
-        return await self.request("POST", "/api/usb/bind", {"busid": busid, "force": force}, timeout=30)
+    async def bind(self, busid: str, force: bool = False, restore_owner: bool = False) -> dict:
+        body: dict[str, Any] = {"busid": busid, "force": force}
+        if restore_owner:
+            body["restore_owner"] = True
+        return await self.request("POST", "/api/usb/bind", body, timeout=30)
 
     async def unbind(self, busid: str) -> dict:
         return await self.request("POST", "/api/usb/unbind", {"busid": busid}, timeout=30)
