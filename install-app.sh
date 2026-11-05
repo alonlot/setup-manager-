@@ -3,6 +3,7 @@
 #
 #   ./install-app.sh            install or upgrade
 #   ./install-app.sh --no-apt   do not install system packages
+#   ./install-app.sh --no-sudo  only the app (venv, command, menu): no step that needs sudo
 #   ./install-app.sh --uninstall
 #
 # It installs: system packages (GTK 4, libadwaita, VTE, usbip client), a Python
@@ -17,17 +18,19 @@ DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 VENV="$DATA/setup-manager/venv"
 BIN="$HOME/.local/bin"
 APT=1
+NOSUDO=0
 
 for arg in "$@"; do
   case "$arg" in
     --no-apt) APT=0;;
+    --no-sudo) APT=0; NOSUDO=1;;
     --uninstall)
       rm -rf "$DATA/setup-manager/venv" "$BIN/setup-manager" "$DATA/applications/$APP_ID.desktop" \
              "$DATA/icons/hicolor/scalable/apps/$APP_ID.svg"
       sudo rm -f /etc/sudoers.d/setup-manager
       echo "Setup Manager removed (your config in ~/.config/setup-manager is kept)."
       exit 0;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0;;
     *) echo "unknown option: $arg" >&2; exit 1;;
   esac
 done
@@ -107,7 +110,9 @@ if [[ -n "$USBIP" ]] && ! usbip version >/dev/null 2>&1; then
   fi
 fi
 MODPROBE="$(command -v modprobe || echo /usr/sbin/modprobe)"
-if [[ -n "$USBIP" || -n "$REAL" ]]; then
+if [[ $NOSUDO -eq 1 ]]; then
+  echo "-- skipped (--no-sudo): the sudo rule for usbip, and loading vhci-hcd. Run ./install-app.sh in a terminal once for them."
+elif [[ -n "$USBIP" || -n "$REAL" ]]; then
   echo ">> allowing '$ME' to run usbip and modprobe without a password (sudo)"
   CMDS="/usr/lib/linux-tools/*/usbip, /usr/lib/linux-tools-*/usbip"
   [[ -n "$USBIP" ]] && CMDS="$USBIP, $CMDS"
@@ -121,7 +126,7 @@ else
   echo "!! usbip not found. Attach will not work until you install it (Ubuntu: sudo apt install linux-tools-$(uname -r))."
 fi
 
-if getent group dialout >/dev/null && ! id -nG "$ME" | grep -qw dialout; then
+if [[ $NOSUDO -eq 0 ]] && getent group dialout >/dev/null && ! id -nG "$ME" | grep -qw dialout; then
   echo ">> adding $ME to the dialout group (serial ports of attached devices; log out and in once)"
   sudo usermod -aG dialout "$ME"
 fi

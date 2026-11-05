@@ -85,8 +85,13 @@ class Rollout:
     def ssh_port(self, s: dict[str, Any]) -> int | None:
         return self.opts.ssh_port or s.get("ssh_port") or None
 
+    @staticmethod
+    def _batch() -> list[str]:
+        # No terminal (an AI agent, a script): SSH must fail at once, not wait for a password.
+        return [] if sys.stdin.isatty() else ["-o", "BatchMode=yes"]
+
     def _ssh_base(self, port: int | None = None) -> list[str]:
-        return ["ssh", "-o", "ConnectTimeout=15"] + (["-p", str(port)] if port else [])
+        return ["ssh", "-o", "ConnectTimeout=15"] + self._batch() + (["-p", str(port)] if port else [])
 
     def ssh(self, target: str, command: str, stdin: str | None = None, timeout: float = 120,
             port: int | None = None) -> tuple[int, str]:
@@ -95,10 +100,20 @@ class Rollout:
         return p.returncode, (p.stdout + p.stderr).strip()
 
     def scp(self, target: str, files: list[Path], remote_dir: str, port: int | None = None) -> tuple[int, str]:
-        cmd = ["scp", "-q"] + (["-P", str(port)] if port else [])
+        cmd = ["scp", "-q"] + self._batch() + (["-P", str(port)] if port else [])
         p = subprocess.run(cmd + [str(f) for f in files] + [f"{target}:{remote_dir}/"], capture_output=True,
                            text=True, timeout=120)
         return p.returncode, (p.stdout + p.stderr).strip()
+
+    def _sudo_password(self, target: str) -> str:
+        env = os.environ.get("SETUP_MANAGER_SUDO_PASSWORD")
+        if env:
+            return env
+        if self.opts.ask_secret is getpass.getpass and not sys.stdin.isatty():
+            raise RuntimeError(f"sudo on {target} needs a password, and there is no terminal to ask it. Run "
+                               "./update-lab.sh once in a terminal, or allow sudo without a password on the "
+                               "setup PC, or set SETUP_MANAGER_SUDO_PASSWORD")
+        return self.opts.ask_secret("sudo password on the setup PCs (asked once, kept in memory only): ")
 
     # -- plan -----------------------------------------------------------------------
     def targets(self) -> list[dict[str, Any]]:
@@ -173,8 +188,7 @@ class Rollout:
             rc, out = self.ssh(target, "sudo -n true", port=port)
             if rc != 0:
                 if self.sudo_password is None:
-                    self.sudo_password = self.opts.ask_secret(
-                        "sudo password on the setup PCs (asked once, kept in memory only): ")
+                    self.sudo_password = self._sudo_password(target)
                 sudo = "sudo -S -p ''"
 
             data = self.store.data()
@@ -283,6 +297,9 @@ class Rollout:
 
     # -- all -------------------------------------------------------------------------------
     def run(self) -> int:
+        if not (self.opts.yes or self.opts.dry_run) and self.opts.ask is input and not sys.stdin.isatty():
+            self.say("No terminal to answer questions: run it again with --yes.")
+            return 1
         setups = self.targets()
         if not setups:
             self.say("No setups in the config. Add one first: setup-manager deploy USER@HOST --name NAME")

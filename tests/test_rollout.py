@@ -183,3 +183,33 @@ def test_ssh_port_is_saved_per_setup(manager_config, remote, monkeypatch):
     log = remote["log"].read_text()
     assert "-p 2222" in log
     assert ConfigStore(manager_config).get_setup("bench")["ssh_port"] == 2222
+
+
+# --------------------------------------------------------------------------- no terminal (an AI agent, a script)
+
+def test_no_terminal_without_yes_does_not_start(manager_config, remote):
+    o, out = opts(yes=False, ask=input)  # the real prompt: there is no terminal under pytest
+    assert Rollout(ConfigStore(manager_config), o).run() == 1
+    assert "--yes" in out.getvalue()
+    assert not remote["log"].exists()
+
+
+def test_no_terminal_sudo_password_from_the_environment(manager_config, remote, monkeypatch):
+    import getpass
+    monkeypatch.setenv("FAKE_SUDO_PASSWORD", "pw")
+    o, out = opts(only=["bench"], ask_secret=getpass.getpass)
+    # Without the variable: a clear error for the PC, not a hang or a traceback.
+    assert Rollout(ConfigStore(manager_config), o).run() == 2
+    assert "no terminal to ask it" in out.getvalue() and "SETUP_MANAGER_SUDO_PASSWORD" in out.getvalue()
+    monkeypatch.setenv("SETUP_MANAGER_SUDO_PASSWORD", "pw")
+    o, out = opts(only=["bench"], ask_secret=getpass.getpass)
+    assert Rollout(ConfigStore(manager_config), o).run() == 0, out.getvalue()
+    # SSH must not wait for a password that nobody can type.
+    assert "-o BatchMode=yes" in remote["log"].read_text()
+
+
+def test_update_lab_needs_yes_without_a_terminal(tmp_path):
+    import subprocess
+    script = Path(__file__).resolve().parent.parent / "update-lab.sh"
+    p = subprocess.run(["bash", str(script)], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    assert p.returncode == 1 and "--yes" in p.stderr

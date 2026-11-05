@@ -588,6 +588,27 @@ update uses SSH, not the agent token.
 Tip: use SSH keys (`ssh-copy-id dev@bench-1`). Then only the sudo password is asked, once.
 After the update, close the app and open it again.
 
+### From an AI agent or a script
+
+Tell your agent (for example Claude Code, opened in this folder on your PC) "apply the new fix". It runs:
+
+```bash
+./update-lab.sh --yes
+```
+
+It asks nothing, and it does not wait for input that nobody can type:
+
+- Sudo on this PC: used only when it needs no password. Else the app is updated without the sudo steps
+  (the setup PCs get the new agent anyway); run `./install-app.sh` in a terminal later for the sudo rule.
+- Sudo on the setup PCs: passwordless sudo, or the password in `SETUP_MANAGER_SUDO_PASSWORD`. Else that
+  PC fails with a clear message, and the other PCs continue.
+- SSH: keys only (no password prompt).
+- Exit code: 0 = all setup PCs updated, 2 = some failed (run it again: it continues), 1 = not started.
+
+So that it can finish without you, do this once: `ssh-copy-id USER@HOST` for each setup PC, and allow the
+installer to run with sudo without a password on the setup PCs (or run `./update-lab.sh` once in a terminal).
+`CLAUDE.md` in this folder tells AI agents these steps.
+
 ## Security
 
 ### How it connects
