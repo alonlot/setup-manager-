@@ -10,7 +10,10 @@ systemctl daemon-reload
 rm -rf /opt/setup-agent
 for t in iptables ip6tables; do  # the rule that blocks USB/IP from the network
   command -v $t >/dev/null || continue
-  while $t -D INPUT -p tcp --dport 3240 ! -i lo -m comment --comment setup-agent-usbip -j DROP 2>/dev/null; do :; done
+  for target in "REJECT --reject-with tcp-reset" DROP; do  # DROP: the rule of older agents
+    # shellcheck disable=SC2086
+    while $t -D INPUT -p tcp --dport 3240 ! -i lo -m comment --comment setup-agent-usbip -j $target 2>/dev/null; do :; done
+  done
 done
 [[ "${1:-}" == "--purge" ]] && rm -rf /etc/setup-agent
 echo "setup-agent removed"

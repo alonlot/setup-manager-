@@ -232,8 +232,40 @@ def test_firewall_rule(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
     assert sa.usbip_firewall(True, 3240) == ["iptables: blocked", "ip6tables: blocked"]
     calls = log.read_text().splitlines()
-    assert "iptables -I INPUT -p tcp --dport 3240 ! -i lo -m comment --comment setup-agent-usbip -j DROP" in calls
+    match = "INPUT -p tcp --dport 3240 ! -i lo -m comment --comment setup-agent-usbip"
+    # REJECT with a TCP reset: a `usbip attach` by hand fails at once, it does not hang (DROP did).
+    assert f"iptables -I {match} -j REJECT --reject-with tcp-reset" in calls
+    assert f"ip6tables -I {match} -j REJECT --reject-with tcp-reset" in calls
+    assert f"iptables -D {match} -j DROP" in calls  # the rule of an older agent is removed
+    assert not any(c.startswith("iptables -I") and c.endswith("-j DROP") for c in calls)
     assert sa.usbip_firewall(False, 3240) == []  # nothing to remove
+
+
+def test_firewall_replaces_the_old_drop_rule(tmp_path, monkeypatch):
+    """An agent update: the DROP rule of the old agent goes, the REJECT rule comes."""
+    from setup_manager.agent import setup_agent as sa
+    log, state = tmp_path / "calls.txt", tmp_path / "rules"
+    state.write_text("DROP\n")
+    f = tmp_path / "iptables"
+    # A tiny iptables: the file "rules" holds the targets of the setup-agent rules, one per line.
+    f.write_text(f'''#!/bin/sh
+echo "iptables $*" >> {log}
+op=$1; shift
+case "$*" in *"-j DROP"*) t=DROP;; *) t=REJECT;; esac
+case "$op" in
+  -C) grep -qx "$t" {state};;
+  -I) echo "$t" >> {state};;
+  -D) grep -qx "$t" {state} || exit 1; grep -vx "$t" {state} > {state}.new; mv {state}.new {state};;
+esac
+''')
+    f.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+    assert sa.usbip_firewall(True, 3240) == ["iptables: blocked"]
+    assert state.read_text().split() == ["REJECT"]
+    assert sa.usbip_firewall(True, 3240) == []  # already there: nothing to do
+    assert state.read_text().split() == ["REJECT"]
+    assert sa.usbip_firewall(False, 3240) == ["iptables: unblocked"]
+    assert state.read_text().split() == []
 
 
 def test_tls_setup_without_a_pin_is_pinned_on_the_first_connection(manager_config, agent):

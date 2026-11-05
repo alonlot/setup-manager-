@@ -315,8 +315,9 @@ class MainWindow(Adw.ApplicationWindow):
             copy_text(self, busid)
             self.toast("Bus ID copied")
         elif action == "copy-attach":
-            s = self.store.get_setup(sid)
-            copy_text(self, f"sudo usbip attach -r {s['host'] if s else sid} -b {busid}")
+            # Not "usbip attach -r HOST": the agent blocks USB/IP from the network (it goes only through
+            # the encrypted tunnel), so only this command works from another PC.
+            copy_text(self, f"setup-manager attach {sid} {busid}")
             self.toast("Command copied")
 
     def _rename(self, sid: str, busid: str, d: dict[str, Any]) -> None:

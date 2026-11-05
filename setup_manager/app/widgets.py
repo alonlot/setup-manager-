@@ -190,7 +190,7 @@ def device_row(win: "MainWindow", sid: str, d: dict[str, Any], show_setup: bool 
     item("Rename…", "rename", "document-edit-symbolic")
     item("USB reset (re-plug)", "reset", "view-refresh-symbolic")
     item("Copy bus ID", "copy-busid", "edit-copy-symbolic")
-    item("Copy usbip attach command", "copy-attach", "edit-copy-symbolic")
+    item("Copy attach command", "copy-attach", "edit-copy-symbolic")
 
     more = Gtk.MenuButton(icon_name="view-more-symbolic", popover=pop, valign=Gtk.Align.CENTER,
                           css_classes=["flat"], tooltip_text="More actions")

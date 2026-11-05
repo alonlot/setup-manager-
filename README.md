@@ -110,7 +110,7 @@ Add setups with **+** (host and token) or with **Scan network** in the main menu
 | Place | What you can do |
 |---|---|
 | Overview | All setups with CPU, RAM and USB counts. The devices attached to your PC, with Detach. The keep-attached list. |
-| Setup > USB | One row per device: state, name, vid:pid, serial, tty names, drivers. **Attach** shares the device and attaches it to your PC. **Detach** detaches it and stops sharing. The **⋮** menu: share only, stop sharing, detach and keep shared, keep attached, auto-share when plugged, USB reset, copy bus ID, copy the usbip command. |
+| Setup > USB | One row per device: state, name, vid:pid, serial, tty names, drivers. **Attach** shares the device and attaches it to your PC. **Detach** detaches it and stops sharing. The **⋮** menu: share only, stop sharing, detach and keep shared, keep attached, auto-share when plugged, USB reset, copy bus ID, copy the attach command (`setup-manager attach SETUP BUSID`). |
 | Setup > Terminal | Real terminal tabs (VTE) on the setup PC. **+** opens a new tab. A tab stays open when you go to other pages. Ctrl+Shift+C / Ctrl+Shift+V copy and paste. Ctrl +/- zooms. |
 | Setup > Run | Run one command with a timeout and an optional user. Quick commands (right-click a quick command to remove it). |
 | Setup > Info / Log | System details, and the recent log lines of the agent. |
@@ -376,7 +376,7 @@ error "reserved by ci-42 until 12:30". Everybody can still read the serial port.
 - The reservation renews itself while your program runs. If the program dies, it ends after `ttl` seconds.
 - `wait=` waits for a board that somebody else has. Without it, you get `BoardBusy` at once.
 - A device that is not reserved works as before.
-- A device that is already shared over USB/IP can still be attached with `usbip attach` by hand. USB/IP itself has no locks. Reserve a board before you share it.
+- USB/IP itself has no locks. A device that is shared (bound) can be attached by a client that does not use Setup Manager: `usbip attach` on the setup PC itself, or from the network when the agent was installed with `--open-usbip`. Reserve a board before you share it.
 
 Reservations need agent 0.3.0 or newer: run `setup-manager deploy` again.
 
@@ -576,7 +576,7 @@ the shell, the serial data, the files, and the USB traffic.
 | The agent's identity | The app pins the SHA-256 fingerprint of the certificate, like SSH `known_hosts`. A different certificate is refused ("the TLS certificate of ... changed! This can be an attack"). |
 | The first connection | `setup-manager deploy` reads the fingerprint over SSH, so the first connection is also safe. When you add a setup by hand, type the `CONFIG_FINGERPRINT` from `install.sh` in the fingerprint field, or the app trusts the certificate at the first connection. |
 | Access | A random token for each PC (32 bytes), unless you choose to use one token for all PCs. Without the token, only the name and version are visible. |
-| USB/IP | It goes only through the encrypted tunnel, which needs the token. The agent blocks port 3240 from the network with an iptables rule (`setup-agent-usbip`). Reservations also apply to the tunnel. |
+| USB/IP | It goes only through the encrypted tunnel, which needs the token. The agent blocks port 3240 from the network with an iptables rule (`setup-agent-usbip`, it refuses the connection). Reservations also apply to the tunnel. |
 | Downgrade | A setup with a pinned fingerprint never uses plain HTTP. |
 | Files | The tokens are in files with mode 600 on both sides. The key of the certificate is mode 600. |
 
@@ -606,6 +606,7 @@ fingerprint in **Edit setup**. To check a fingerprint: `setup-manager trust benc
 | "agent rejected the token" | The token in the app does not match `/etc/setup-agent/config.json`. |
 | "usbipd is not running" | Click **Start usbipd** in the banner, or `sudo systemctl restart setup-usbipd` on the setup PC. |
 | usbip not found on the setup PC, or bind fails with "usbip not found for kernel ..." | Ubuntu: `/usr/bin/usbip` is a wrapper that needs the tools of the running kernel (after a kernel update too): `sudo apt install linux-tools-$(uname -r)`. Without them, the agent uses the newest `/usr/lib/linux-tools/*/usbip` that it finds; the status shows the path and the hint. Debian: `sudo apt install usbip`. |
+| `usbip attach -r SETUP-PC` by hand fails with "connection refused" | Normal: the agent blocks USB/IP from the network, so that it is always encrypted. Use `setup-manager attach SETUP BUSID` (it goes through the encrypted tunnel), or run `usbip attach -r localhost` on the setup PC itself. Only on a network that you trust completely: install the agent with `--open-usbip`. |
 | Attach fails with "password is required" | Run `./install-app.sh` again (it adds the sudo rule). |
 | Attach fails with "open vhci_driver" | `sudo modprobe vhci-hcd` on your PC. |
 | Attach times out | Old agent: port 3240/tcp on the setup PC is blocked. Update the agent (USB/IP then goes through port 8765). |

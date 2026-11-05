@@ -1790,21 +1790,34 @@ FW_COMMENT = "setup-agent-usbip"
 
 
 def usbip_firewall(block, port=3240):
-    """Block (or unblock) USB/IP from the network, so that it works only through the encrypted tunnel."""
+    """Block (or unblock) USB/IP from the network, so that it works only through the encrypted tunnel.
+
+    The rule refuses the connection (TCP reset): a `usbip attach` by hand from another PC fails at
+    once with "connection refused", instead of hanging for two minutes (older agents used DROP).
+    """
     done = []
+    match = ["INPUT", "-p", "tcp", "--dport", str(port), "!", "-i", "lo", "-m", "comment", "--comment", FW_COMMENT]
+    rule = match + ["-j", "REJECT", "--reject-with", "tcp-reset"]
+    old_rule = match + ["-j", "DROP"]
+
+    def delete_all(tool, r):
+        n = 0
+        while subprocess.run([tool, "-D"] + r, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            n += 1
+        return n
+
     for tool in ("iptables", "ip6tables"):
         if not shutil.which(tool):
             continue
-        rule = ["INPUT", "-p", "tcp", "--dport", str(port), "!", "-i", "lo", "-m", "comment", "--comment",
-                FW_COMMENT, "-j", "DROP"]
-        exists = subprocess.run([tool, "-C"] + rule, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if block and exists.returncode != 0:
-            p = subprocess.run([tool, "-I"] + rule, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            done.append("%s: %s" % (tool, "blocked" if p.returncode == 0 else p.stdout.decode(errors="replace")))
-        elif not block:
-            while subprocess.run([tool, "-D"] + rule, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL).returncode == 0:
-                done.append("%s: unblocked" % tool)
+        replaced = delete_all(tool, old_rule)  # the DROP rule of an older agent
+        if block:
+            exists = subprocess.run([tool, "-C"] + rule, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if exists.returncode != 0:
+                p = subprocess.run([tool, "-I"] + rule, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                done.append("%s: %s" % (tool, "blocked" if p.returncode == 0 else p.stdout.decode(errors="replace")))
+        else:
+            n = replaced + delete_all(tool, rule)
+            done += ["%s: unblocked" % tool] * n
     return done
 
 
