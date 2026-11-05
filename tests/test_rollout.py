@@ -89,13 +89,14 @@ def test_full_rollout(manager_config, remote, monkeypatch):
     assert cfg.data()["require_encryption"] is True
     assert cfg.data()["agent_defaults"]["token"] == ""
     assert cfg.data()["rollout_pending"] == {}
-    # The device that was attached here is attached again (with the new token, through the tunnel).
+    # The device that was attached here is attached again: plain USB/IP (the default), let in by the
+    # agent with the new token.
     assert "attached again: 1-2" in text
 
     async def check():
         async with Fleet(ConfigStore(manager_config)) as f:
             ports = await f.local_ports()
-            assert [(p["setup"], p["busid"], p["encrypted"]) for p in ports] == [("bench", "1-2", True)]
+            assert [(p["setup"], p["busid"], p["encrypted"]) for p in ports] == [("bench", "1-2", False)]
             await f.detach("bench", "1-2")
     asyncio.run(check())
     assert "2 of 2 setup PCs updated" in text and bundled_version() in text

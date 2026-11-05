@@ -14,6 +14,7 @@ API (all routes except /api/ping need "Authorization: Bearer <token>"):
   GET  /api/status                   PC status
   GET  /api/usb[?all=1]              USB devices (all=1 also shows hubs)
   POST /api/usb/bind    {busid, force, restore_owner}
+  POST /api/usb/allow   {busid}  (plain USB/IP: let the caller's IP attach for 30 s)
   POST /api/usb/unbind  {busid}
   POST /api/usb/reset   {busid}
   POST /api/usb/identify {busid, reset, baud, duration, script, after_script, tty, user}
@@ -1963,6 +1964,73 @@ class UsbipRelay:
 
 
 FW_COMMENT = "setup-agent-usbip"
+FW_ALLOW = "setup-agent-usbip-allow"  # one client IP that may connect to usbipd for a short time
+ALLOW_SECONDS = 30  # enough for `usbip attach`; the connection stays after the rule is gone
+
+
+def _rules_with_comment(tool, table, chain, comment):
+    """The rules (as argument lists after the chain name) that have exactly this comment."""
+    p = subprocess.run([tool, "-t", table, "-S", chain], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    out = []
+    for line in p.stdout.decode(errors="replace").splitlines():
+        if not line.startswith("-A "):
+            continue
+        args = shlex.split(line)
+        if "--comment" in args and args[args.index("--comment") + 1] == comment:
+            out.append(args[2:])
+    return out
+
+
+def _delete_with_comment(tool, table, chain, comment):
+    for args in _rules_with_comment(tool, table, chain, comment):
+        subprocess.run([tool, "-t", table, "-D", chain] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def usbip_direct_setup(port=3240):
+    """Prepare plain USB/IP for the clients that Setup Manager lets in (POST /api/usb/allow).
+
+    An allowed client IP connects to usbipd directly (the kernel does the USB/IP, no relay). The rule
+    for the IP is removed after ALLOW_SECONDS; an ESTABLISHED rule keeps its connection. Returns True
+    when it works (iptables with conntrack).
+    """
+    ok = False
+    for tool in ("iptables", "ip6tables"):
+        if not shutil.which(tool):
+            continue
+        for table, chain in (("filter", "INPUT"), ("nat", "PREROUTING")):
+            _delete_with_comment(tool, table, chain, FW_ALLOW)  # from an earlier run
+        est = ["INPUT", "-p", "tcp", "--dport", str(port), "!", "-i", "lo", "-m", "conntrack", "--ctstate",
+               "ESTABLISHED,RELATED", "-m", "comment", "--comment", FW_COMMENT, "-j", "ACCEPT"]
+        while subprocess.run([tool, "-D"] + est, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            pass
+        # At the top, above the REJECT rule (which is already there).
+        p = subprocess.run([tool, "-I"] + est, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if p.returncode == 0:
+            ok = ok or tool == "iptables"
+        else:
+            log.warning("%s: no plain USB/IP for Setup Manager (conntrack): %s", tool,
+                        p.stdout.decode(errors="replace").strip())
+    return ok
+
+
+def usbip_allow_ip(ip, port=3240, on=True):
+    """Let one client IP connect to usbipd (on=False: remove that again)."""
+    tool = "ip6tables" if ":" in ip else "iptables"
+    rules = [("filter", ["INPUT", "-s", ip, "-p", "tcp", "--dport", str(port), "-m", "comment", "--comment",
+                         FW_ALLOW, "-j", "ACCEPT"]),
+             ("nat", ["PREROUTING", "-s", ip, "-p", "tcp", "--dport", str(port), "-m", "comment", "--comment",
+                      FW_ALLOW, "-j", "RETURN"])]  # RETURN: not to the filter for devices shared by hand
+    for table, rule in rules:
+        base = [tool, "-t", table]
+        if on:
+            if subprocess.run(base + ["-C"] + rule, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+                p = subprocess.run(base + ["-I"] + rule, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                if p.returncode != 0:
+                    raise ApiError(500, "cannot let %s in for USB/IP: %s" % (ip, p.stdout.decode(errors="replace")))
+        else:
+            while subprocess.run(base + ["-D"] + rule, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL).returncode == 0:
+                pass
 
 
 def usbip_firewall(block, port=3240, redirect_to=None):
@@ -2007,16 +2075,13 @@ def _usbip_redirect(tool, port, to_port):
     if to_port:
         want = ["PREROUTING", "-p", "tcp", "--dport", str(port), "!", "-i", "lo", "-m", "comment",
                 "--comment", FW_COMMENT, "-j", "REDIRECT", "--to-ports", str(to_port)]
-    p = subprocess.run([tool, "-t", "nat", "-S", "PREROUTING"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     have = False
-    for line in p.stdout.decode(errors="replace").splitlines():
-        if FW_COMMENT not in line or not line.startswith("-A "):
-            continue
-        args = shlex.split(line)
+    for args in _rules_with_comment(tool, "nat", "PREROUTING", FW_COMMENT):
         if want and args[-2:] == ["--to-ports", str(to_port)]:
             have = True
             continue
-        subprocess.run([tool, "-t", "nat", "-D"] + args[1:], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([tool, "-t", "nat", "-D", "PREROUTING"] + args, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
     if want and not have:
         r = subprocess.run([tool, "-t", "nat", "-I"] + want, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         notes.append("%s: %s" % (tool, "port %d from the network goes to the filter for devices shared by hand "
@@ -2251,12 +2316,18 @@ class Agent:
         self.tunnels = {}
         self.tls_fingerprint = None
         self.usbip_relay_port = None  # the filter for plain USB/IP of devices shared by hand
+        # Plain USB/IP for Setup Manager (the token goes over TLS, the USB data does not):
+        # "open" (port 3240 is open anyway), "allow" (the firewall lets the caller in), None (off).
+        self.usbip_direct = None
+        self.allowed = {}  # client IP -> time when its firewall rule goes
+        self.allow_lock = threading.Lock()
         self.res_lock = threading.Lock()
 
     # -- API handlers ----------------------------------------------------------
     def ping(self):
         return {"service": "setup-agent", "name": self.cfg["name"], "hostname": socket.gethostname(),
                 "tls": bool(self.tls_fingerprint), "tunnel": bool(self.tls_fingerprint),
+                "usbip_direct": bool(self.usbip_direct),
                 "fingerprint": self.tls_fingerprint,
                 "version": VERSION}
 
@@ -2425,6 +2496,34 @@ class Agent:
         if r and not any(hmac.compare_digest(x, r["lease"]) for x in leases):
             raise ApiError(423, "%s is reserved by %s until %s" % (
                 busid, r["owner"], time.strftime("%H:%M:%S", time.localtime(r["expires"]))))
+
+    def usbip_allow(self, body, ip):
+        """Plain USB/IP for a client with the token (the token came over TLS): let its IP connect to
+        usbipd for ALLOW_SECONDS. The reservation of the device is checked like for the other actions."""
+        dev = self.usb.get(body.get("busid"))
+        if not self.usbip_direct:
+            raise ApiError(409, "plain USB/IP is off on this setup PC (installed with --tunnel-only, or the "
+                                "agent cannot change the firewall): use the encrypted tunnel")
+        port = int(self.cfg.get("usbip_port") or 3240)
+        if self.usbip_direct == "allow":
+            with self.allow_lock:
+                if ip not in self.allowed:
+                    usbip_allow_ip(ip, port, True)
+                self.allowed[ip] = time.time() + ALLOW_SECONDS
+        log.info("plain USB/IP: %s may attach %s", ip, dev["busid"])
+        return {"ip": ip, "port": port, "seconds": ALLOW_SECONDS, "busid": dev["busid"]}
+
+    def allow_janitor(self):
+        while True:
+            time.sleep(5)
+            with self.allow_lock:
+                for ip, until in list(self.allowed.items()):
+                    if until < time.time():
+                        try:
+                            usbip_allow_ip(ip, int(self.cfg.get("usbip_port") or 3240), False)
+                        except Exception:  # pragma: no cover
+                            log.exception("cannot remove the USB/IP rule of %s", ip)
+                        self.allowed.pop(ip, None)
 
     def plain_usbip_refusal(self, busid):
         """Why a plain USB/IP client (no token) cannot use this device, or None when it can."""
@@ -2744,6 +2843,7 @@ class Agent:
 
 # The actions that need the lease while a device is reserved.
 LEASE_ROUTES = {("POST", "/api/usb/bind"), ("POST", "/api/usb/unbind"), ("POST", "/api/usb/reset"),
+                ("POST", "/api/usb/allow"),
                 ("POST", "/api/usb/identify"), ("POST", "/api/usb/flash"), ("POST", "/api/serial/write"),
                 ("POST", "/api/serial/reset")}
 
@@ -2915,6 +3015,7 @@ class Handler(BaseHTTPRequestHandler):
                 ("POST", "/api/usb/identify"): lambda: a.identify(body),
                 ("POST", "/api/usb/flash"): lambda: a.flash(body),
                 ("POST", "/api/usb/claim"): lambda: a.claim(body, self.real_ip()),
+                ("POST", "/api/usb/allow"): lambda: a.usbip_allow(body, self.real_ip()),
                 ("POST", "/api/usb/release"): lambda: a.release(body),
                 ("POST", "/api/usb/nickname"): lambda: a.set_nickname(body),
                 ("GET", "/api/serial"): lambda: {"sessions": a.hub.list()},
@@ -3074,10 +3175,19 @@ def main(argv=None):
                         "available from the network (only the encrypted tunnel works).",
                         cfg.get("usbip_relay_port") or 3241, e)
     agent.usbip_relay_port = usbip_relay.port if usbip_relay else None
+    block = bool(use_tls) and mode != "open"
     if os.geteuid() == 0:
-        block = bool(use_tls) and mode != "open"
         for note in usbip_firewall(block, int(cfg.get("usbip_port") or 3240), agent.usbip_relay_port):
             log.info("USB/IP port: %s", note)
+    if use_tls and not block:
+        agent.usbip_direct = "open"
+    elif use_tls and mode == "manual" and os.geteuid() == 0 and usbip_direct_setup(int(cfg.get("usbip_port") or 3240)):
+        agent.usbip_direct = "allow"
+        threading.Thread(target=agent.allow_janitor, name="usbip-allow", daemon=True).start()
+    if agent.usbip_direct:
+        log.info("USB/IP for Setup Manager: plain (the token goes over TLS), %s",
+                 "port %s is open" % (cfg.get("usbip_port") or 3240) if agent.usbip_direct == "open" else
+                 "the firewall lets each client in for %d s" % ALLOW_SECONDS)
 
     if os.geteuid() == 0:
         threading.Thread(target=agent.usb.ensure_usbipd, name="usbipd-init", daemon=True).start()

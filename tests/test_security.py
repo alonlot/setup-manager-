@@ -9,6 +9,7 @@ import struct
 import subprocess
 import sys
 import threading
+import urllib.error
 import urllib.request
 
 import pytest
@@ -115,7 +116,15 @@ def test_nothing_readable_on_the_network(manager_config, agent):
         assert secret not in seen, secret
 
 
+def _manager_option(manager_config, **kw):
+    data = json.loads(manager_config.read_text())
+    data.update(kw)
+    manager_config.write_text(json.dumps(data))
+
+
 def test_usbip_goes_through_the_tunnel(manager_config, agent):
+    _manager_option(manager_config, encrypt_usbip=True)  # "Encrypt USB/IP" in the preferences
+
     async def go():
         async with Fleet(ConfigStore(manager_config)) as f:
             r = await f.attach("bench", "1-2")
@@ -146,6 +155,7 @@ def test_tunnel_needs_the_token(agent):
 
 def test_tunnel_respects_reservations(manager_config, agent):
     from setup_manager import Lab
+    _manager_option(manager_config, encrypt_usbip=True)
 
     async def plain_attach():
         async with Fleet(ConfigStore(manager_config)) as f:
@@ -431,5 +441,51 @@ def test_the_manager_says_when_a_device_was_shared_by_hand(tmp_path, sysfs):
         detail = run(go())
         assert detail["1-2"].endswith("(shared by hand: plain usbip works)")
         assert "by hand" not in detail["1-1"]
+    finally:
+        stop_agent(agent)
+
+
+def test_plain_usbip_for_the_manager_with_the_token_over_tls(manager_config, agent):
+    """The default: USB/IP is plain (to usbipd, no relay), only the token goes (over TLS) to the agent."""
+    data = json.loads(manager_config.read_text())
+    data["setups"][0]["usbip_port"] = agent["usbipd"].port
+    manager_config.write_text(json.dumps(data))
+    assert _api(agent, "GET", "/api/ping")["usbip_direct"] is True
+
+    async def go():
+        async with Fleet(ConfigStore(manager_config)) as f:
+            r = await f.attach("bench", "1-2")
+            assert "not encrypted" in r["message"] and "TLS" in r["message"]
+            assert agent["usbipd"].imports == ["1-2"]  # straight to usbipd, not through the tunnel
+            ports = await f.local_ports()
+            assert [(p["setup"], p["busid"], p["encrypted"]) for p in ports] == [("bench", "1-2", False)]
+            assert ports[0]["remote_port"] == agent["usbipd"].port
+            await f.detach("bench", "1-2")
+    run(go())
+
+
+def test_allow_needs_the_token_and_respects_reservations(agent):
+    req = urllib.request.Request(agent_url(agent, "/api/usb/allow"), method="POST",
+                                 data=json.dumps({"busid": "1-2"}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, context=insecure_ctx(), timeout=10)
+    assert e.value.code == 401
+    r = _api(agent, "POST", "/api/usb/allow", {"busid": "1-2"})
+    assert r["ip"] == "127.0.0.1" and r["seconds"] > 0
+    res = _api(agent, "POST", "/api/reserve", {"busid": "1-2", "owner": "ci", "ttl": 60})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _api(agent, "POST", "/api/usb/allow", {"busid": "1-2"})
+    assert e.value.code == 423
+    _api(agent, "POST", "/api/release", {"busid": "1-2", "lease": res["lease"]})
+
+
+def test_tunnel_only_agent_makes_the_manager_use_the_tunnel(tmp_path, sysfs):
+    agent = start_agent(tmp_path, sysfs, usbip_network="tunnel")
+    try:
+        assert _api(agent, "GET", "/api/ping")["usbip_direct"] is False
+        with pytest.raises(urllib.error.HTTPError) as e:
+            _api(agent, "POST", "/api/usb/allow", {"busid": "1-2"})
+        assert e.value.code == 409
     finally:
         stop_agent(agent)

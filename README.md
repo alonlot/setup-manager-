@@ -89,12 +89,12 @@ The installer:
 - Loads `usbip-host` at boot.
 - Sets the shell user to the user that ran sudo (`run_as`). Shells and commands run as this user, not root.
 - Makes a TLS certificate for this PC and prints its fingerprint as `CONFIG_FINGERPRINT=...`.
-- USB/IP from the network: the devices that Setup Manager shares go only through the encrypted agent port. A device that you share by hand (`sudo usbip bind -b BUSID` on the setup PC) also works with plain `usbip attach -r SETUP-PC` from other PCs, as without Setup Manager (see [Devices shared by hand](#devices-shared-by-hand)).
+- USB/IP from the network: a device that Setup Manager shares can be attached only by a PC that asked the agent first, with the token, over TLS. A device that you share by hand (`sudo usbip bind -b BUSID` on the setup PC) also works with plain `usbip attach -r SETUP-PC` from other PCs, as without Setup Manager (see [Devices shared by hand](#devices-shared-by-hand)).
 - Opens the agent port in ufw when ufw is active (8765/tcp, 8765/udp, and 3241/tcp for devices shared by hand).
 
 Options: `--token`, `--port`, `--run-as USER`, `--auto-bind RULE`, `--protect RULE`, `--install-deps`,
 `--plain` (no TLS: NOT encrypted), `--open-usbip` (port 3240 open for all devices: USB/IP NOT encrypted),
-`--tunnel-only` (no plain USB/IP from the network, also not for devices shared by hand).
+`--tunnel-only` (USB/IP only through the encrypted tunnel: no plain USB/IP from the network at all).
 Run `install.sh` again to upgrade. It keeps the existing config. To remove: `sudo ./uninstall.sh [--purge]`.
 
 Check the agent on the setup PC: `systemctl status setup-agent` and `journalctl -u setup-agent -f`.
@@ -396,7 +396,7 @@ sudo usbip attach -r SETUP-PC -b 1-1.2
 usbip list -r SETUP-PC      # shows only the devices that are shared by hand
 ```
 
-- The agent knows which devices Setup Manager shared (also after a restart). Only those are encrypted-only. The app says "shared by hand: plain usbip works" next to such a device (`shared_by` in `setup-manager usb --json`).
+- The agent knows which devices Setup Manager shared (also after a restart). Only those need the token. The app says "shared by hand: plain usbip works" next to such a device (`shared_by` in `setup-manager usb --json`).
 - A device that you shared by hand stays "by hand" when Setup Manager unshares it for a short time (flash, identify).
 - When Setup Manager stops sharing a device and you share it by hand, it is "by hand" from then on.
 - A reserved device is refused, also when it was shared by hand.
@@ -583,14 +583,17 @@ After the update, close the app and open it again.
  your PC (app, CLI, MCP, Lab)                         setup PC
  TLS 1.2+ ──────────────────── TCP 8765 ────────────►  setup-agent
    - API, shell, serial, files: every request has the token
-   - USB/IP: a tunnel in the same TLS port ("SMTUNNEL <token>"), relayed to usbipd on 127.0.0.1
+   - USB/IP: "let me in" (POST /api/usb/allow, with the token) -> the agent opens port 3240
+     for the IP of your PC for 30 s
+ plain USB/IP ───────────────── TCP 3240 ───────────►  usbipd (the kernel does the USB/IP)
  UDP 8765 broadcast (Scan network only) ────────────►  name, port, version, fingerprint (no secrets)
  SSH (setup-manager deploy only) ──── TCP 22 ───────►  install / update the agent
-                                                       port 3240 (usbipd): only devices shared by hand
 ```
 
-Everything that goes over the network is encrypted: the token, the commands and their output,
-the shell, the serial data, the files, and the USB traffic.
+Encrypted: the token, the commands and their output, the shell, the serial data and the files.
+The USB traffic is plain USB/IP, as with `usbip` by hand: it is fast, and the token never goes in it.
+To encrypt the USB traffic too, turn on **Preferences > Encrypt USB/IP** (`"encrypt_usbip": true`):
+then USB/IP goes through a tunnel in the TLS port ("SMTUNNEL <token>"), which is slower.
 
 | Part | What protects it |
 |---|---|
@@ -598,14 +601,13 @@ the shell, the serial data, the files, and the USB traffic.
 | The agent's identity | The app pins the SHA-256 fingerprint of the certificate, like SSH `known_hosts`. A different certificate is refused ("the TLS certificate of ... changed! This can be an attack"). |
 | The first connection | `setup-manager deploy` reads the fingerprint over SSH, so the first connection is also safe. When you add a setup by hand, type the `CONFIG_FINGERPRINT` from `install.sh` in the fingerprint field, or the app trusts the certificate at the first connection. |
 | Access | A random token for each PC (32 bytes), unless you choose to use one token for all PCs. Without the token, only the name and version are visible. |
-| USB/IP | The devices that Setup Manager shares go only through the encrypted tunnel, which needs the token. Port 3240 from the network goes to a filter in the agent (iptables rules `setup-agent-usbip`): it lets through only the devices that you shared by hand. Reservations also apply to the tunnel and to the filter. |
+| USB/IP | Not encrypted (unless **Encrypt USB/IP** is on). A device that Setup Manager shares can be attached only from an IP that asked the agent with the token in the last 30 seconds (iptables rules `setup-agent-usbip-allow`); the connection stays after that. Other connections to port 3240 go to a filter in the agent (`setup-agent-usbip`): it lets through only the devices that you shared by hand. Reservations apply to all of these. |
 | Downgrade | A setup with a pinned fingerprint never uses plain HTTP. |
 | Files | The tokens are in files with mode 600 on both sides. The key of the certificate is mode 600. |
 
-**Old agents:** agents before version 0.4 have no TLS. The app still works with them, but shows
-"not encrypted" on the setup, and attaches USB/IP without encryption. Run `setup-manager deploy` for
-each setup PC to update it. Then turn on **Preferences > Require encryption**, so that the app refuses
-any connection that is not encrypted.
+**Old agents:** agents before version 0.4 have no TLS, so their token goes in clear text. The app still
+works with them, but shows "not encrypted" on the setup. Run `setup-manager deploy` for each setup PC to
+update it. Then turn on **Preferences > Require encryption**, so that the app refuses agents without TLS.
 
 **After you reinstall a setup PC** (new certificate): `setup-manager trust bench-1 --forget`, or clear the
 fingerprint in **Edit setup**. To check a fingerprint: `setup-manager trust bench-1`, and on the setup PC:
@@ -619,6 +621,7 @@ fingerprint in **Edit setup**. To check a fingerprint: `setup-manager trust benc
 - `setup-manager mcp --http` has no authentication. It listens on 127.0.0.1, so every user who can log in to your PC can use it. The stdio mode (the default) does not have this problem.
 - `--plain` and `--open-usbip` turn the encryption off. Use them only on a network that you trust completely.
 - A device that you share by hand is NOT encrypted and needs no token, like plain USB/IP without Setup Manager. Use `--tunnel-only` to turn this off.
+- The USB traffic of Setup Manager is not encrypted (the token is). Somebody on the network can read it, and a PC that has the same IP address as yours (behind the same NAT) can attach a device in the 30 seconds after you. Turn on **Encrypt USB/IP** if that matters on your network.
 
 ## Troubleshooting
 
@@ -629,11 +632,11 @@ fingerprint in **Edit setup**. To check a fingerprint: `setup-manager trust benc
 | "agent rejected the token" | The token in the app does not match `/etc/setup-agent/config.json`. |
 | "usbipd is not running" | Click **Start usbipd** in the banner, or `sudo systemctl restart setup-usbipd` on the setup PC. |
 | usbip not found on the setup PC, or bind fails with "usbip not found for kernel ..." | Ubuntu: `/usr/bin/usbip` is a wrapper that needs the tools of the running kernel (after a kernel update too): `sudo apt install linux-tools-$(uname -r)`. Without them, the agent uses the newest `/usr/lib/linux-tools/*/usbip` that it finds; the status shows the path and the hint. Debian: `sudo apt install usbip`. |
-| `usbip attach -r SETUP-PC` by hand fails with "Request Failed" | Setup Manager shared this device: it is encrypted only. Use `setup-manager attach SETUP BUSID`, or stop sharing it in the app and share it by hand (`sudo usbip bind -b BUSID` on the setup PC). |
+| `usbip attach -r SETUP-PC` by hand fails with "Request Failed" | Setup Manager shared this device: it needs the token. Use `setup-manager attach SETUP BUSID`, or stop sharing it in the app and share it by hand (`sudo usbip bind -b BUSID` on the setup PC). |
 | `usbip attach -r SETUP-PC` by hand fails with "connection refused" | The agent was installed with `--tunnel-only`, or it is not running, or ufw blocks port 3241. Use `setup-manager attach SETUP BUSID`. |
 | Attach fails with "password is required" | Run `./install-app.sh` again (it adds the sudo rule). |
 | Attach fails with "open vhci_driver" | `sudo modprobe vhci-hcd` on your PC. |
-| Attach times out | Old agent: port 3240/tcp on the setup PC is blocked. Update the agent (USB/IP then goes through port 8765). |
+| Attach times out or is refused | A firewall between the PCs blocks port 3240/tcp: open it, or turn on **Encrypt USB/IP** (USB/IP then goes through port 8765). |
 | "the TLS certificate of ... changed" | You reinstalled the agent: `setup-manager trust SETUP --forget`. If you did not, somebody can be between you and the PC: find out before you trust it. |
 | "does not use encryption" | The agent is older than 0.4 or was installed with `--plain`: `setup-manager deploy USER@HOST`. |
 | Scan network finds nothing | Discovery uses UDP broadcast and works only in one subnet. Add the setups by IP. |

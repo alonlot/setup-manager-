@@ -200,6 +200,10 @@ class AgentClient:
             body["restore_owner"] = True
         return await self.request("POST", "/api/usb/bind", body, timeout=30)
 
+    async def usbip_allow(self, busid: str) -> dict:
+        """Plain USB/IP: the agent lets this PC's IP connect to usbipd for a short time."""
+        return await self.request("POST", "/api/usb/allow", {"busid": busid}, timeout=15)
+
     async def unbind(self, busid: str) -> dict:
         return await self.request("POST", "/api/usb/unbind", {"busid": busid}, timeout=30)
 

@@ -29,8 +29,11 @@ DEFAULTS: dict[str, Any] = {
     "sticky": [],
     # rollout: new tokens that are saved before the install (a failed run continues with them).
     "rollout_pending": {},
-    # true = refuse agents without TLS (agents before version 0.4) and USB/IP without the tunnel.
+    # true = refuse agents without TLS (agents before version 0.4): the token would go in clear text.
     "require_encryption": False,
+    # true = USB/IP through the encrypted tunnel of the agent (slower). false = plain USB/IP, as with
+    # usbip by hand; the token still goes only over TLS, and the agent lets only this PC's IP in.
+    "encrypt_usbip": False,
     # Your name for the setups ("in use by ..."). Empty = user@hostname.
     "client_name": "",
     # Flash: your own profiles and the last options per device.

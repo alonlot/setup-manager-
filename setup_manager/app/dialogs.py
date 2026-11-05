@@ -176,9 +176,13 @@ def preferences_dialog(win: "MainWindow") -> None:
     poll.set_title("Refresh interval (seconds)")
     poll.set_value(float(data.get("poll_interval") or 5))
     require = Adw.SwitchRow(title="Require encryption",
-                            subtitle="Refuse agents without TLS (older than 0.4) and USB/IP without the tunnel",
+                            subtitle="Refuse agents without TLS (older than 0.4): their token goes in clear text",
                             active=bool(data.get("require_encryption")))
-    for r in (client, token, port, poll, require):
+    encrypt_usbip = Adw.SwitchRow(title="Encrypt USB/IP",
+                                  subtitle="Off: plain USB/IP, as usbip by hand (faster). The token always goes "
+                                           "over TLS. On: USB/IP through the encrypted tunnel",
+                                  active=bool(data.get("encrypt_usbip")))
+    for r in (client, token, port, poll, require, encrypt_usbip):
         agents.add(r)
     page.add(agents)
 
@@ -209,6 +213,7 @@ def preferences_dialog(win: "MainWindow") -> None:
         data["agent_defaults"]["port"] = int(port.get_value())
         data["poll_interval"] = int(poll.get_value())
         data["require_encryption"] = require.get_active()
+        data["encrypt_usbip"] = encrypt_usbip.get_active()
         data["local_usbip"]["command"] = cmd.get_text().strip() or None
         data["local_usbip"]["sudo"] = {0: None, 1: True, 2: False}[sudo.get_selected()]
         win.store.save()

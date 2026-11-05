@@ -394,7 +394,8 @@ class Fleet:
             return {"message": out or "attached", "port": p, "device": dev}
 
     async def _attach_usbip(self, setup: dict[str, Any], busid: str) -> str:
-        """usbip attach: through the encrypted tunnel of the agent, or directly (old agent, not encrypted)."""
+        """usbip attach: plain USB/IP to usbipd (the agent lets this PC in, asked over TLS with the token),
+        or through the encrypted tunnel of the agent ("encrypt_usbip"), or directly (old agent)."""
         c = self.client(setup)
         info: dict[str, Any] = {}
         try:
@@ -403,6 +404,18 @@ class Fleet:
                 info = await c.ping()
         except AgentError as e:
             raise FleetError(e.message, e.status or 502) from None
+        if c.encrypted and info.get("usbip_direct") and not self.store.data().get("encrypt_usbip"):
+            try:
+                await c.usbip_allow(busid)
+            except AgentError as e:
+                if e.status != 409:  # 409: plain USB/IP is off there: use the tunnel
+                    raise FleetError(e.message, e.status or 502) from None
+            else:
+                try:
+                    out = await self.local.attach(setup["host"], busid, setup.get("usbip_port", 3240))
+                except UsbipError as e:
+                    raise FleetError(f"attach failed: {e}", 500) from None
+                return out or "attached (USB/IP not encrypted, the token went over TLS)"
         if c.encrypted and info.get("tunnel"):
             leases = list(getattr(c, "_leases", []) or [])
             try:
@@ -423,8 +436,8 @@ class Fleet:
             tunnel.save_tunnels(tunnels)
             return out or "attached (encrypted)"
         if self.store.data().get("require_encryption"):
-            raise FleetError(f"{setup['name']} cannot tunnel USB/IP (agent before version 0.4): update it, or "
-                             "turn off 'require encryption'", 495)
+            raise FleetError(f"{setup['name']} has no TLS (agent before version 0.4): its token would go in "
+                             "clear text. Update it, or turn off 'require encryption'", 495)
         try:
             out = await self.local.attach(setup["host"], busid, setup.get("usbip_port", 3240))
         except UsbipError as e:
