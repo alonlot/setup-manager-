@@ -65,7 +65,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 DEFAULT_CONFIG_PATH = "/etc/setup-agent/config.json"
 DISCOVERY_MAGIC = b"SETUP-MANAGER-DISCOVER"
 BUSID_RE = re.compile(r"^\d+-\d+(\.\d+)*$")

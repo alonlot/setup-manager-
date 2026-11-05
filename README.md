@@ -547,6 +547,8 @@ Restart after a change: `sudo systemctl restart setup-agent`.
 
 ## Update everything (this PC and all setup PCs)
 
+What changed in each version, and what to do before you update: [CHANGELOG.md](CHANGELOG.md).
+
 ```bash
 cd setup-manager
 ./update-lab.sh --dry-run      # see the plan first
